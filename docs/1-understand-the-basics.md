@@ -3,8 +3,6 @@
 Before you are able to effectively use Zarf, it is useful to have an underlying understanding of the technology Zarf is built on and around. The sections below provide some helpful links to start building up this foundation as well as a glossary of the terms used in this project.
 
 <!-- TODO: The links and information on this page need to be expanded a lot more to really be useful -->
-
-<br />
 <br />
 
 ## Fundamental Technologies
@@ -15,18 +13,13 @@ Before you are able to effectively use Zarf, it is useful to have an underlying 
 - [Learn Kubernetes Basics](https://kubernetes.io/docs/tutorials/kubernetes-basics/)
 - [Free Introduction to Kubernetes Course](https://www.edx.org/course/introduction-to-kubernetes)
 - [Super charge your Kubernetes deployments](https://www.youtube.com/watch?v=N6UCKF7JD7k)
-  <br />
-  <br />
 
 ### AirGap Basics
 
 - [What is AirGap](https://ibm.github.io/kubernetes-networking/vpc/airgap/)
 - AirGap Kubernetes Course - Coming Soon!
 
-<br />
-<br />
-
-## GitOps Basics
+### GitOps Basics
 
 - [CloudBees GitOps Definition](https://www.cloudbees.com/gitops/what-is-gitops)
 - [Understanding Git](https://hackernoon.com/understanding-git-fcffd87c15a3)
