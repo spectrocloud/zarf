@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/defenseunicorns/zarf/src/internal/kustomize"
-	"github.com/defenseunicorns/zarf/src/internal/packager/validate"
+	"github.com/defenseunicorns/zarf/src/packager/validate"
 	"github.com/defenseunicorns/zarf/src/types"
 
 	"github.com/defenseunicorns/zarf/src/config"
