@@ -33,17 +33,25 @@ func Create(baseDir string) {
 		message.Note(fmt.Sprintf("Using build directory %s", baseDir))
 	}
 
-	if err := config.LoadConfig(config.ZarfYAML); err != nil {
+	if err := config.LoadConfig(config.ZarfYAML, false); err != nil {
 		message.Fatal(err, "Unable to read the zarf.yaml file")
 	}
+
+	ComposeComponents()
+
+	// After components are composed, template the active package
+	if err := config.FillActiveTemplate(); err != nil {
+		message.Fatalf(err, "Unable to fill variables in template: %s", err.Error())
+	}
+
+	components := config.GetComponents()
 
 	tempPath := createPaths()
 	defer tempPath.clean()
 
-	components := GetComponents()
-	seedImage := config.GetSeedImage()
+	seedImage := config.ZarfSeedImage
 
-	configFile := tempPath.base + "/zarf.yaml"
+	configFile := tempPath.zarfYaml
 
 	// Save the transformed config
 	if err := config.BuildConfig(configFile); err != nil {
@@ -53,11 +61,11 @@ func Create(baseDir string) {
 	// Perform early package validation
 	validate.Run()
 
-	if !confirmAction(configFile, "Create", nil) {
+	if !confirmAction("Create", nil) {
 		os.Exit(0)
 	}
 
-	if seedImage != "" {
+	if config.IsZarfInitConfig() {
 		// Load seed images into their own happy little tarball for ease of import on init
 		pulledImages := images.PullAll([]string{seedImage}, tempPath.seedImage)
 		sbom.CatalogImages(pulledImages, tempPath.sboms, tempPath.seedImage)
@@ -85,7 +93,7 @@ func Create(baseDir string) {
 	packageName := filepath.Join(config.CreateOptions.OutputDirectory, config.GetPackageName())
 
 	_ = os.RemoveAll(packageName)
-	err := archiver.Archive([]string{tempPath.base + "/"}, packageName)
+	err := archiver.Archive([]string{tempPath.base + string(os.PathSeparator)}, packageName)
 	if err != nil {
 		message.Fatal(err, "Unable to create the package archive")
 	}
@@ -95,20 +103,34 @@ func addComponent(tempPath tempPaths, component types.ZarfComponent) {
 	message.HeaderInfof("📦 %s COMPONENT", strings.ToUpper(component.Name))
 	componentPath := createComponentPaths(tempPath.components, component)
 
+	// Loop through each component prepare script and execute it
+	for _, script := range component.Scripts.Prepare {
+		loopScriptUntilSuccess(script, component.Scripts)
+	}
+
 	if len(component.Charts) > 0 {
 		_ = utils.CreateDirectory(componentPath.charts, 0700)
 		_ = utils.CreateDirectory(componentPath.values, 0700)
 		re := regexp.MustCompile(`\.git$`)
 		for _, chart := range component.Charts {
 			isGitURL := re.MatchString(chart.Url)
+			URLLen := len(chart.Url)
 			if isGitURL {
 				_ = helm.DownloadChartFromGit(chart, componentPath.charts)
-			} else {
+			} else if URLLen > 0 {
 				helm.DownloadPublishedChart(chart, componentPath.charts)
+			} else {
+				path := helm.CreateChartFromLocalFiles(chart, componentPath.charts)
+				zarfFilename := fmt.Sprintf("%s-%s.tgz", chart.Name, chart.Version)
+				if !strings.HasSuffix(path, zarfFilename) {
+					message.Fatalf(fmt.Errorf("error creating chart archive"), "User provided chart name and/or version does not match given chart")
+				}
 			}
 			for idx, path := range chart.ValuesFiles {
 				chartValueName := helm.StandardName(componentPath.values, chart) + "-" + strconv.Itoa(idx)
-				utils.CreatePathAndCopy(path, chartValueName)
+				if err := utils.CreatePathAndCopy(path, chartValueName); err != nil {
+					message.Fatalf(err, "Unable to copy values file %s", path)
+				}
 			}
 		}
 	}
@@ -117,11 +139,13 @@ func addComponent(tempPath tempPaths, component types.ZarfComponent) {
 		_ = utils.CreateDirectory(componentPath.files, 0700)
 		for index, file := range component.Files {
 			message.Debugf("Loading %#v", file)
-			destinationFile := componentPath.files + "/" + strconv.Itoa(index)
+			destinationFile := filepath.Join(componentPath.files, strconv.Itoa(index))
 			if utils.IsUrl(file.Source) {
 				utils.DownloadToFile(file.Source, destinationFile, component.CosignKeyPath)
 			} else {
-				utils.CreatePathAndCopy(file.Source, destinationFile)
+				if err := utils.CreatePathAndCopy(file.Source, destinationFile); err != nil {
+					message.Fatalf(err, "Unable to copy %s", file.Source)
+				}
 			}
 
 			// Abort packaging on invalid shasum (if one is specified)
@@ -141,18 +165,26 @@ func addComponent(tempPath tempPaths, component types.ZarfComponent) {
 
 	if len(component.DataInjections) > 0 {
 		spinner := message.NewProgressSpinner("Loading data injections")
-		defer spinner.Stop()
+		defer spinner.Success()
 		for _, data := range component.DataInjections {
 			spinner.Updatef("Copying data injection %s for %s", data.Target.Path, data.Target.Selector)
-			destinationFile := componentPath.dataInjections + "/" + filepath.Base(data.Target.Path)
-			utils.CreatePathAndCopy(data.Source, destinationFile)
+			destinationFile := filepath.Join(componentPath.dataInjections, filepath.Base(data.Target.Path))
+			if err := utils.CreatePathAndCopy(data.Source, destinationFile); err != nil {
+				spinner.Fatalf(err, "Unable to copy data injection %s", data.Source)
+			}
 		}
-		spinner.Success()
 	}
 
 	if len(component.Manifests) > 0 {
-		spinner := message.NewProgressSpinner("Loading %d manifests", len(component.Manifests))
-		defer spinner.Stop()
+		// Get the proper count of total manifests to add
+		manifestCount := 0
+		for _, manifest := range component.Manifests {
+			manifestCount += len(manifest.Files)
+			manifestCount += len(manifest.Kustomizations)
+		}
+
+		spinner := message.NewProgressSpinner("Loading %d K8s manifests", manifestCount)
+		defer spinner.Success()
 
 		if err := utils.CreateDirectory(componentPath.manifests, 0700); err != nil {
 			spinner.Fatalf(err, "Unable to create the manifest path %s", componentPath.manifests)
@@ -164,7 +196,9 @@ func addComponent(tempPath tempPaths, component types.ZarfComponent) {
 				// Copy manifests without any processing
 				spinner.Updatef("Copying manifest %s", file)
 				destination := fmt.Sprintf("%s/%s", componentPath.manifests, file)
-				utils.CreatePathAndCopy(file, destination)
+				if err := utils.CreatePathAndCopy(file, destination); err != nil {
+					spinner.Fatalf(err, "Unable to copy the manifest %s", file)
+				}
 			}
 			for idx, kustomization := range manifest.Kustomizations {
 				// Generate manifests from kustomizations and place in the package
@@ -175,17 +209,19 @@ func addComponent(tempPath tempPaths, component types.ZarfComponent) {
 				}
 			}
 		}
-		spinner.Success()
 	}
 
 	// Load all specified git repos
 	if len(component.Repos) > 0 {
 		spinner := message.NewProgressSpinner("Loading %d git repos", len(component.Repos))
-		defer spinner.Stop()
+		defer spinner.Success()
 		for _, url := range component.Repos {
 			// Pull all the references if there is no `@` in the string
-			git.Pull(url, componentPath.repos, spinner)
+			_, err := git.Pull(url, componentPath.repos, spinner)
+			if err != nil {
+				message.Fatalf(err, fmt.Sprintf("Unable to pull the repo with the url of (%s}", url))
+			}
 		}
-		spinner.Success()
 	}
+
 }

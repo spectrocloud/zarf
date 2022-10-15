@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	netHttp "net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -27,33 +28,60 @@ type Credential struct {
 	Auth http.BasicAuth
 }
 
-func MutateGitUrlsInText(host string, text string) string {
+var (
+	// For further explanation: https://regex101.com/r/zq64q4/1
+	gitURLRegex = regexp.MustCompile(`^(?P<proto>[a-z]+:\/\/)(?P<hostPath>.+?)\/(?P<repo>[\w\-\.]+?)(?P<git>\.git)?(?P<atRef>@(?P<ref>[\w\-\.]+))?$`)
+)
+
+// MutateGitURlsInText Changes the giturl hostname to use the repository Zarf is configured to use
+func MutateGitUrlsInText(host string, text string, gitUser string) string {
 	extractPathRegex := regexp.MustCompilePOSIX(`https?://[^/]+/(.*\.git)`)
 	output := extractPathRegex.ReplaceAllStringFunc(text, func(match string) string {
-		if strings.Contains(match, "/"+config.ZarfGitPushUser+"/") {
-			message.Warnf("%s seems to have been previously patched.", match)
-			return match
+		output, err := transformURL(host, match, gitUser)
+		if err != nil {
+			message.Warnf("Unable to transform the git url, using the original url we have: %s", match)
+			output = match
 		}
-		return transformURL(host, match)
+		return output
 	})
 	return output
 }
 
-func transformURLtoRepoName(url string) string {
-	replaceRegex := regexp.MustCompile(`(https?://|[^\w\-.])+`)
-	return "mirror" + replaceRegex.ReplaceAllString(url, "__")
+func transformURLtoRepoName(url string) (string, error) {
+	matches := gitURLRegex.FindStringSubmatch(url)
+	idx := gitURLRegex.SubexpIndex
+
+	if len(matches) == 0 {
+		// Unable to find a substring match for the regex
+		return "", fmt.Errorf("unable to get extract the repoName from the url %s", url)
+	}
+
+	repoName := matches[idx("repo")]
+	// NOTE: We remove the .git and protocol so that https://zarf.dev/repo.git and http://zarf.dev/repo
+	// resolve to the same repp (as they would in real life)
+	sanitizedURL := fmt.Sprintf("%s/%s%s", matches[idx("hostPath")], repoName, matches[idx("atRef")])
+
+	// Add crc32 hash of the repoName to the end of the repo
+	table := crc32.MakeTable(crc32.IEEE)
+	checksum := crc32.Checksum([]byte(sanitizedURL), table)
+	newRepoName := fmt.Sprintf("%s-%d", repoName, checksum)
+
+	return newRepoName, nil
 }
 
-func transformURL(baseUrl string, url string) string {
-	replaced := transformURLtoRepoName(url)
-	output := baseUrl + "/" + config.ZarfGitPushUser + "/" + replaced
+func transformURL(baseURL string, url string, username string) (string, error) {
+	repoName, err := transformURLtoRepoName(url)
+	if err != nil {
+		return "", err
+	}
+	output := fmt.Sprintf("%s/%s/%s", baseURL, username, repoName)
 	message.Debugf("Rewrite git URL: %s -> %s", url, output)
-	return output
+	return output, nil
 }
 
 func credentialFilePath() string {
 	homePath, _ := os.UserHomeDir()
-	return homePath + "/.git-credentials"
+	return filepath.Join(homePath, ".git-credentials")
 }
 
 func credentialParser() []Credential {
@@ -64,7 +92,7 @@ func credentialParser() []Credential {
 	defer func(credentialsFile *os.File) {
 		err := credentialsFile.Close()
 		if err != nil {
-			message.Debugf("Unable to load an existing git credentials file: %w", err)
+			message.Debugf("Unable to load an existing git credentials file: %#v", err)
 		}
 	}(credentialsFile)
 
@@ -249,11 +277,12 @@ func CreateReadOnlyUser() error {
 	defer tunnel.Close()
 
 	tunnelUrl := tunnel.Endpoint()
+	zarfState := config.GetState()
 
 	// Create json representation of the create-user request body
 	createUserBody := map[string]interface{}{
-		"username":             config.ZarfGitReadUser,
-		"password":             config.GetSecret(config.StateGitPull),
+		"username":             zarfState.GitServer.PullUsername,
+		"password":             zarfState.GitServer.PullPassword,
 		"email":                "zarf-reader@localhost.local",
 		"must_change_password": false,
 	}
@@ -265,21 +294,23 @@ func CreateReadOnlyUser() error {
 	// Send API request to create the user
 	createUserEndpoint := fmt.Sprintf("http://%s/api/v1/admin/users", tunnelUrl)
 	createUserRequest, _ := netHttp.NewRequest("POST", createUserEndpoint, bytes.NewBuffer(createUserData))
-	_, err = DoHttpThings(createUserRequest, config.ZarfGitPushUser, config.GetSecret(config.StateGitPush))
+	out, err := DoHttpThings(createUserRequest, zarfState.GitServer.PushUsername, zarfState.GitServer.PushPassword)
+	message.Debugf("POST %s:\n%s", createUserEndpoint, string(out))
 	if err != nil {
 		return err
 	}
 
 	// Make sure the user can't create their own repos or orgs
 	updateUserBody := map[string]interface{}{
-		"email":                     "zarf-reader@localhost.local",
+		"login_name":                zarfState.GitServer.PushUsername,
 		"max_repo_creation":         0,
 		"allow_create_organization": false,
 	}
 	updateUserData, _ := json.Marshal(updateUserBody)
-	updateUserEndpoint := fmt.Sprintf("http://%s/api/v1/admin/users/%s", tunnelUrl, config.ZarfGitReadUser)
+	updateUserEndpoint := fmt.Sprintf("http://%s/api/v1/admin/users/%s", tunnelUrl, zarfState.GitServer.PullUsername)
 	updateUserRequest, _ := netHttp.NewRequest("PATCH", updateUserEndpoint, bytes.NewBuffer(updateUserData))
-	_, err = DoHttpThings(updateUserRequest, config.ZarfGitPushUser, config.GetSecret(config.StateGitPush))
+	out, err = DoHttpThings(updateUserRequest, zarfState.GitServer.PushUsername, zarfState.GitServer.PushPassword)
+	message.Debugf("PATCH %s:\n%s", updateUserEndpoint, string(out))
 	return err
 }
 
@@ -294,18 +325,19 @@ func addReadOnlyUserToRepo(tunnelUrl, repo string) error {
 	}
 
 	// Send API request to add a user as a read-only collaborator to a repo
-	addColabEndpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/collaborators/%s", tunnelUrl, config.ZarfGitPushUser, repo, config.ZarfGitReadUser)
+	addColabEndpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/collaborators/%s", tunnelUrl, config.GetState().GitServer.PushUsername, repo, config.GetState().GitServer.PullUsername)
 	addColabRequest, _ := netHttp.NewRequest("PUT", addColabEndpoint, bytes.NewBuffer(addColabData))
-	_, err = DoHttpThings(addColabRequest, config.ZarfGitPushUser, config.GetSecret(config.StateGitPush))
+	out, err := DoHttpThings(addColabRequest, config.GetState().GitServer.PushUsername, config.GetState().GitServer.PushPassword)
+	message.Debugf("PUT %s:\n%s", addColabEndpoint, string(out))
 	return err
 }
 
 // Add http request boilerplate and perform the request, checking for a successful response
 func DoHttpThings(request *netHttp.Request, username, secret string) ([]byte, error) {
-	message.Debugf("Performing %v http request to %v", request.Method, request.URL)
+	message.Debugf("Performing %s http request to %#v", request.Method, request.URL)
 
 	// Prep the request with boilerplate
-	client := &netHttp.Client{Timeout: time.Second * 10}
+	client := &netHttp.Client{Timeout: time.Second * 20}
 	request.SetBasicAuth(username, secret)
 	request.Header.Add("accept", "application/json")
 	request.Header.Add("Content-Type", "application/json")
@@ -319,7 +351,7 @@ func DoHttpThings(request *netHttp.Request, username, secret string) ([]byte, er
 
 	// If we get a 'bad' status code we will have no error, create a useful one to return
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		err = errors.New(fmt.Sprintf("Got status code of %v during http request with body of: %v", response.StatusCode, string(responseBody)))
+		err = fmt.Errorf("got status code of %d during http request with body of: %s", response.StatusCode, string(responseBody))
 		return []byte{}, err
 	}
 

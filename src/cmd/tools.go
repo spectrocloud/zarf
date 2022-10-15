@@ -1,23 +1,17 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
-	"github.com/defenseunicorns/zarf/src/types"
-
-	"github.com/alecthomas/jsonschema"
+	"github.com/anchore/syft/cmd/syft/cli"
 	"github.com/defenseunicorns/zarf/src/config"
-	"github.com/defenseunicorns/zarf/src/internal/git"
 	"github.com/defenseunicorns/zarf/src/internal/k8s"
 	"github.com/defenseunicorns/zarf/src/internal/message"
-	"github.com/defenseunicorns/zarf/src/internal/utils"
 	k9s "github.com/derailed/k9s/cmd"
 	craneCmd "github.com/google/go-containerregistry/cmd/crane/cmd"
 	"github.com/mholt/archiver/v3"
 	"github.com/spf13/cobra"
-	"github.com/spf13/cobra/doc"
 )
 
 var toolsCmd = &cobra.Command{
@@ -63,15 +57,20 @@ var archiverDecompressCmd = &cobra.Command{
 
 var registryCmd = &cobra.Command{
 	Use:     "registry",
-	Aliases: []string{"r"},
+	Aliases: []string{"r", "crane"},
 	Short:   "Collection of registry commands provided by Crane",
 }
 
 var readCredsCmd = &cobra.Command{
-	Use:   "get-admin-password",
-	Short: "Returns the Zarf admin password for gitea read from the zarf-state secret in the zarf namespace",
+	Use:   "get-git-password",
+	Short: "Returns the push user's password for the Git server",
+	Long:  "Reads the password for a user with push access to the configured Git server from the zarf-state secret in the zarf namespace",
 	Run: func(cmd *cobra.Command, args []string) {
-		state := k8s.LoadZarfState()
+		state, err := k8s.LoadZarfState()
+		if err != nil {
+			message.Fatal(err, "Unable to load Zarf state")
+		}
+
 		if state.Distro == "" {
 			// If no distro the zarf secret did not load properly
 			message.Fatalf(nil, "Unable to load the zarf/zarf-state secret, did you remember to run zarf init first?")
@@ -80,21 +79,8 @@ var readCredsCmd = &cobra.Command{
 		// Continue loading state data if it is valid
 		config.InitState(state)
 
-		fmt.Println(config.GetSecret(config.StateGitPush))
-	},
-}
-
-var configSchemaCmd = &cobra.Command{
-	Use:     "config-schema",
-	Aliases: []string{"c"},
-	Short:   "Generates a JSON schema for the zarf.yaml configuration",
-	Run: func(cmd *cobra.Command, args []string) {
-		schema := jsonschema.Reflect(&types.ZarfPackage{})
-		output, err := json.MarshalIndent(schema, "", "  ")
-		if err != nil {
-			message.Fatal(err, "Unable to generate the zarf config schema")
-		}
-		fmt.Print(string(output) + "\n")
+		message.Note("Git Server Push Password: ")
+		fmt.Println(state.GitServer.PushPassword)
 	},
 }
 
@@ -109,55 +95,75 @@ var k9sCmd = &cobra.Command{
 	},
 }
 
-var createReadOnlyGiteaUser = &cobra.Command{
-	Use:    "create-read-only-gitea-user",
-	Hidden: true,
-	Short:  "Creates a read-only user in Gitea",
-	Long: "Creates a read-only user in Gitea by using the Gitea API. " +
-		"This is called internally by the supported Gitea package component.",
+var clearCacheCmd = &cobra.Command{
+	Use:     "clear-cache",
+	Aliases: []string{"c"},
+	Short:   "Clears the configured git and image cache directory",
 	Run: func(cmd *cobra.Command, args []string) {
-		// Load the state so we can get the credentials for the admin git user
-		state := k8s.LoadZarfState()
-		config.InitState(state)
-
-		// Create the non-admin user
-		err := git.CreateReadOnlyUser()
-		if err != nil {
-			message.Error(err, "Unable to create a read-only user in the Gitea service.")
+		message.Debugf("Cache directory set to: %s", config.GetAbsCachePath())
+		if err := os.RemoveAll(config.GetAbsCachePath()); err != nil {
+			message.Fatalf("Unable to clear the cache driectory %s: %s", config.GetAbsCachePath(), err.Error())
 		}
-	},
-}
-
-var generateCLIDocs = &cobra.Command{
-	Use:    "generate-cli-docs",
-	Short:  "Creates auto-generated markdown of all the commands for the CLI",
-	Hidden: true,
-	Run: func(cmd *cobra.Command, args []string) {
-		utils.CreateDirectory("clidocs", 0700)
-
-		//Generate markdown of the Zarf command (and all of its child commands)
-		doc.GenMarkdownTree(rootCmd, "./clidocs")
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(toolsCmd)
-	rootCmd.AddCommand(generateCLIDocs)
-
 	toolsCmd.AddCommand(archiverCmd)
 	toolsCmd.AddCommand(readCredsCmd)
-	toolsCmd.AddCommand(configSchemaCmd)
 	toolsCmd.AddCommand(k9sCmd)
 	toolsCmd.AddCommand(registryCmd)
-	toolsCmd.AddCommand(createReadOnlyGiteaUser)
+
+	toolsCmd.AddCommand(clearCacheCmd)
+	clearCacheCmd.Flags().StringVar(&config.CommonOptions.CachePath, "zarf-cache", config.ZarfDefaultCachePath, "Specify the location of the Zarf  artifact cache (images and git repositories)")
 
 	archiverCmd.AddCommand(archiverCompressCmd)
 	archiverCmd.AddCommand(archiverDecompressCmd)
 
 	cranePlatformOptions := config.GetCraneOptions()
-	registryCmd.AddCommand(craneCmd.NewCmdAuthLogin())
+
+	craneLogin := craneCmd.NewCmdAuthLogin()
+	craneLogin.Example = ""
+
+	registryCmd.AddCommand(craneLogin)
 	registryCmd.AddCommand(craneCmd.NewCmdPull(&cranePlatformOptions))
 	registryCmd.AddCommand(craneCmd.NewCmdPush(&cranePlatformOptions))
 	registryCmd.AddCommand(craneCmd.NewCmdCopy(&cranePlatformOptions))
 	registryCmd.AddCommand(craneCmd.NewCmdCatalog(&cranePlatformOptions))
+
+	syftCmd, err := cli.New()
+	if err != nil {
+		message.Fatal(err, "Unable to create sbom (syft) CLI")
+	}
+	syftCmd.Use = "sbom"
+	syftCmd.Short = "SBOM tools provided by Anchore Syft"
+	syftCmd.Aliases = []string{"s", "syft"}
+	syftCmd.Example = `  zarf tools sbom packages alpine:latest                                a summary of discovered packages
+  zarf tools sbom packages alpine:latest -o json                        show all possible cataloging details
+  zarf tools sbom packages alpine:latest -o cyclonedx                   show a CycloneDX formatted SBOM
+  zarf tools sbom packages alpine:latest -o cyclonedx-json              show a CycloneDX JSON formatted SBOM
+  zarf tools sbom packages alpine:latest -o spdx                        show a SPDX 2.2 Tag-Value formatted SBOM
+  zarf tools sbom packages alpine:latest -o spdx-json                   show a SPDX 2.2 JSON formatted SBOM
+  zarf tools sbom packages alpine:latest -vv                            show verbose debug information
+  zarf tools sbom packages alpine:latest -o template -t my_format.tmpl  show a SBOM formatted according to given template file
+
+  Supports the following image sources:
+    zarf tools sbom packages yourrepo/yourimage:tag     defaults to using images from a Docker daemon. If Docker is not present, the image is pulled directly from the registry.
+    zarf tools sbom packages path/to/a/file/or/dir      a Docker tar, OCI tar, OCI directory, or generic filesystem directory
+
+  You can also explicitly specify the scheme to use:
+    zarf tools sbom packages docker:yourrepo/yourimage:tag          explicitly use the Docker daemon
+    zarf tools sbom packages podman:yourrepo/yourimage:tag          explicitly use the Podman daemon
+    zarf tools sbom packages registry:yourrepo/yourimage:tag        pull image directly from a registry (no container runtime required)
+    zarf tools sbom packages docker-archive:path/to/yourimage.tar   use a tarball from disk for archives created from "docker save"
+    zarf tools sbom packages oci-archive:path/to/yourimage.tar      use a tarball from disk for OCI archives (from Skopeo or otherwise)
+    zarf tools sbom packages oci-dir:path/to/yourimage              read directly from a path on disk for OCI layout directories (from Skopeo or otherwise)
+    zarf tools sbom packages dir:path/to/yourproject                read directly from a path on disk (any directory)
+    zarf tools sbom packages file:path/to/yourproject/file          read directly from a path on disk (any single file)`
+
+	for _, subCmd := range syftCmd.Commands() {
+		subCmd.Example = ""
+	}
+
+	toolsCmd.AddCommand(syftCmd)
 }

@@ -2,6 +2,8 @@ package validate
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -16,7 +18,19 @@ func Run() {
 	components := config.GetComponents()
 
 	if err := validatePackageName(config.GetMetaData().Name); err != nil {
-		message.Fatalf(err, "Invalid package name")
+		message.Fatalf(err, "Invalid package name: %s", err.Error())
+	}
+
+	for _, variable := range config.GetActiveConfig().Variables {
+		if err := validatePackageVariable(variable); err != nil {
+			message.Fatalf(err, "Invalid package variable: %s", err.Error())
+		}
+	}
+
+	for _, constant := range config.GetActiveConfig().Constants {
+		if err := validatePackageConstant(constant); err != nil {
+			message.Fatalf(err, "Invalid package constant: %s", err.Error())
+		}
 	}
 
 	uniqueNames := make(map[string]bool)
@@ -33,6 +47,14 @@ func Run() {
 
 }
 
+func oneIfNotEmpty(testString string) int {
+	if testString == "" {
+		return 0
+	} else {
+		return 1
+	}
+}
+
 func validateComponent(component types.ZarfComponent) {
 	if component.Required {
 		if component.Default {
@@ -45,12 +67,12 @@ func validateComponent(component types.ZarfComponent) {
 
 	for _, chart := range component.Charts {
 		if err := validateChart(chart); err != nil {
-			message.Fatalf(err, "Invalid chart definition in the %s component: %s", component.Name)
+			message.Fatalf(err, "Invalid chart definition in the %s component: %s (%s)", component.Name, chart.Name, err.Error())
 		}
 	}
 	for _, manifest := range component.Manifests {
 		if err := validateManifest(manifest); err != nil {
-			message.Fatalf(err, "Invalid manifest definition in the %s component: %s", component.Name)
+			message.Fatalf(err, "Invalid manifest definition in the %s component: %s (%s)", component.Name, manifest.Name, err.Error())
 		}
 	}
 }
@@ -58,10 +80,34 @@ func validateComponent(component types.ZarfComponent) {
 func validatePackageName(subject string) error {
 	// https://regex101.com/r/vpi8a8/1
 	isValid := regexp.MustCompile(`^[a-z0-9\-]+$`).MatchString
-	if isValid(subject) {
-		return nil
+
+	if !isValid(subject) {
+		return fmt.Errorf("package name '%s' must be all lowercase and contain no special characters except -", subject)
 	}
-	return fmt.Errorf("package name '%s' must be all lowercase and contain no special characters except -", subject)
+
+	return nil
+}
+
+func validatePackageVariable(subject types.ZarfPackageVariable) error {
+	isAllCapsUnderscore := regexp.MustCompile(`^[A-Z_]+$`).MatchString
+
+	// ensure the variable name is only capitals and underscores
+	if !isAllCapsUnderscore(subject.Name) {
+		return fmt.Errorf("variable name '%s' must be all uppercase and contain no special characters except _", subject.Name)
+	}
+
+	return nil
+}
+
+func validatePackageConstant(subject types.ZarfPackageConstant) error {
+	isAllCapsUnderscore := regexp.MustCompile(`^[A-Z_]+$`).MatchString
+
+	// ensure the constant name is only capitals and underscores
+	if !isAllCapsUnderscore(subject.Name) {
+		return fmt.Errorf("constant name '%s' must be all uppercase and contain no special characters except _", subject.Name)
+	}
+
+	return nil
 }
 
 func validateChart(chart types.ZarfChart) error {
@@ -84,9 +130,15 @@ func validateChart(chart types.ZarfChart) error {
 		return fmt.Errorf("%s must include a namespace", intro)
 	}
 
+	// Must only have one of url, localPath, or gitPath
+	count := oneIfNotEmpty(chart.Url) + oneIfNotEmpty(chart.LocalPath) + oneIfNotEmpty(chart.GitPath)
+	if count != 1 {
+		return fmt.Errorf("%s must only have one of url, localPath or gitPath", intro)
+	}
+	
 	// Must have a url
-	if chart.Url == "" {
-		return fmt.Errorf("%s must include a url", intro)
+	if (chart.Url == "" && chart.LocalPath == "") {
+		return fmt.Errorf("%s must include a url or localPath", intro)
 	}
 
 	// Must have a version
@@ -137,7 +189,7 @@ func ValidateImportPackage(composedComponent *types.ZarfComponent) error {
 
 	// add a forward slash to end of path if it does not have one
 	if !strings.HasSuffix(path, "/") {
-		path = path + "/"
+		path = filepath.Clean(path) + string(os.PathSeparator)
 	}
 
 	// ensure there is a zarf.yaml in provided path

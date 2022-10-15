@@ -1,14 +1,12 @@
 package test
 
 import (
-	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"runtime"
 	"testing"
 
-	"github.com/defenseunicorns/zarf/src/internal/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,20 +18,20 @@ func TestUseCLI(t *testing.T) {
 
 	// Test `zarf prepare sha256sum` for a local asset
 	expectedShasum := "61b50898f982d015ed87093ba822de0fe011cec6dd67db39f99d8c56391a6109\n"
-
-	// TODO: There has to be a better way to pipe this output to the file.. For some reason exec.Command( ... > file ).Output() couldn't pipe to file
-	// output, err = exec.Command("bash", "-c", "\"echo 'random test data 🦄' > shasum-test-file\"").Output()
 	shasumTestFilePath := "shasum-test-file"
 
-	// run `zarf create` with a specified image cache location
-	imageCachePath := "/tmp/.image_cache-location"
+	// run `zarf package create` with a specified image cache location
+	cachePath := filepath.Join(os.TempDir(), ".cache-location")
+	imageCachePath := filepath.Join(cachePath, "images")
+	gitCachePath := filepath.Join(cachePath, "repos")
 
-	e2e.cleanFiles(shasumTestFilePath, imageCachePath)
+	// run `zarf package create` with a specified tmp location
+	otherTmpPath := filepath.Join(os.TempDir(), "othertmp")
 
-	testfile, _ := os.Create(shasumTestFilePath)
-	cmd := exec.Command("echo", "random test data 🦄")
-	cmd.Stdout = testfile
-	_ = cmd.Run()
+	e2e.cleanFiles(shasumTestFilePath, cachePath, otherTmpPath)
+
+	err := os.WriteFile(shasumTestFilePath, []byte("random test data 🦄\n"), 0600)
+	assert.NoError(t, err)
 
 	stdOut, stdErr, err := e2e.execZarfCommand("prepare", "sha256sum", shasumTestFilePath)
 	assert.NoError(t, err, stdOut, stdErr)
@@ -52,7 +50,7 @@ func TestUseCLI(t *testing.T) {
 	assert.NotEqual(t, len(stdOut), 0, "Zarf version should not be an empty string")
 	assert.NotEqual(t, stdOut, "UnknownVersion", "Zarf version should not be the default value")
 
-	// Test for expected failure when given a bad componenet input
+	// Test for expected failure when given a bad component input
 	_, _, err = e2e.execZarfCommand("init", "--confirm", "--components=k3s,foo,logging")
 	assert.Error(t, err)
 
@@ -65,18 +63,56 @@ func TestUseCLI(t *testing.T) {
 	stdOut, stdErr, err = e2e.execZarfCommand("package", "deploy", "https://zarf-examples.s3.amazonaws.com/zarf-package-appliance-demo-doom-20210125.tar.zst", "--confirm")
 	assert.Error(t, err, stdOut, stdErr)
 
-	// Temporary chdir until #511 is merged
-	// TODO: remove this once #511 is merged
-	_ = os.Chdir("examples/game")
-	tmpBin := fmt.Sprintf("../../%s", e2e.zarfBinPath)
-	stdOut, stdErr, err = utils.ExecCommandWithContext(context.TODO(), true, tmpBin, "package", "create", "examples/game", "--confirm", "--zarf-cache", imageCachePath)
-	require.NoError(t, err, stdOut, stdErr)
-	// Reset temp chdir
-	_ = os.Chdir("../..")
+	pkgName := fmt.Sprintf("zarf-package-dos-games-%s.tar.zst", e2e.arch)
 
-	files, err := ioutil.ReadDir(imageCachePath)
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "create", "examples/game", "--confirm", "--zarf-cache", cachePath)
+	require.NoError(t, err, stdOut, stdErr)
+
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "inspect", pkgName)
+	require.NoError(t, err, stdOut, stdErr)
+
+	_ = os.Mkdir(otherTmpPath, 0750)
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "create", "examples/game", "--confirm", "--zarf-cache", cachePath, "--tmpdir", otherTmpPath, "--log-level=debug")
+	require.Contains(t, stdErr, otherTmpPath, "The other tmp path should show as being created")
+	require.NoError(t, err, stdOut, stdErr)
+
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "inspect", pkgName, "--tmpdir", otherTmpPath, "--log-level=debug")
+	require.Contains(t, stdErr, otherTmpPath, "The other tmp path should show as being created")
+	require.NoError(t, err, stdOut, stdErr)
+
+	e2e.cleanFiles(pkgName)
+
+	files, err := os.ReadDir(imageCachePath)
 	require.NoError(t, err, "Error when reading image cache path")
 	assert.Greater(t, len(files), 1)
 
-	e2e.cleanFiles(shasumTestFilePath, imageCachePath)
+	pkgName = fmt.Sprintf("zarf-package-git-data-%s.tar.zst", e2e.arch)
+
+	// Pull once to test git cloning
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "create", "examples/git-data", "--confirm", "--zarf-cache", cachePath, "--tmpdir", otherTmpPath)
+	require.NoError(t, err, stdOut, stdErr)
+
+	files, err = os.ReadDir(gitCachePath)
+	require.NoError(t, err, "Error when reading git cache path")
+	assert.Greater(t, len(files), 1)
+
+	// Pull twice to test git fetching (from cache)
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "create", "examples/git-data", "--confirm", "--zarf-cache", cachePath, "--tmpdir", otherTmpPath)
+	require.NoError(t, err, stdOut, stdErr)
+
+	// Test removal of cache
+	stdOut, stdErr, err = e2e.execZarfCommand("tools", "clear-cache", "--zarf-cache", cachePath)
+	require.NoError(t, err, stdOut, stdErr)
+
+	// Check that ReadDir returns no such file or directory for the cachePath
+	_, err = os.ReadDir(cachePath)
+	if runtime.GOOS == "windows" {
+		msg := fmt.Sprintf("open %s: The system cannot find the file specified.", cachePath)
+		assert.EqualError(t, err, msg, "Did not receive expected error when reading a directory that should not exist")
+	} else {
+		msg := fmt.Sprintf("open %s: no such file or directory", cachePath)
+		assert.EqualError(t, err, msg, "Did not receive expected error when reading a directory that should not exist")
+	}
+
+	e2e.cleanFiles(shasumTestFilePath, cachePath, otherTmpPath, pkgName)
 }

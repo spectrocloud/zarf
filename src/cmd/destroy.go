@@ -25,7 +25,7 @@ var destroyCmd = &cobra.Command{
 	Short:   "Tear it all down, we'll miss you Zarf...",
 	Long: "Tear down Zarf.\n\n" +
 		"Deletes everything in the 'zarf' namespace within your connected k8s cluster.\n\n" +
-		"If Zarf deployed your k8s cluster, this command will also tear your cluster down by" +
+		"If Zarf deployed your k8s cluster, this command will also tear your cluster down by " +
 		"searching through /opt/zarf for any scripts that start with 'zarf-clean-' and executing them. " +
 		"Since this is a cleanup operation, Zarf will not stop the teardown if one of the scripts produce " +
 		"an error.\n\n" +
@@ -37,31 +37,34 @@ var destroyCmd = &cobra.Command{
 		// NOTE: If 'zarf init' failed to deploy the k3s component (or if we're looking at the wrong kubeconfig)
 		//       there will be no zarf-state to load and the struct will be empty. In these cases, if we can find
 		//       the scripts to remove k3s, we will still try to remove a locally installed k3s cluster
-		state := k8s.LoadZarfState()
+		state, err := k8s.LoadZarfState()
+		if err != nil {
+			message.Error(err, "Failed to load Zarf state from cluster")
+		}
 
 		// If Zarf deployed the cluster, burn it all down
-		if state.ZarfAppliance || (state.Secret == "") {
+		if state.ZarfAppliance || (state.Distro == "") {
 			// Check if we have the scripts to destory everything
 			fileInfo, err := os.Stat(config.ZarfCleanupScriptsPath)
 			if errors.Is(err, os.ErrNotExist) || !fileInfo.IsDir() {
-				message.Warnf("Unable to find the folder (%v) which has the scripts to cleanup the cluster. Do you have the right kube-context?\n", config.ZarfCleanupScriptsPath)
+				message.Warnf("Unable to find the folder (%#v) which has the scripts to cleanup the cluster. Do you have the right kube-context?\n", config.ZarfCleanupScriptsPath)
 				return
 			}
 
 			// Run all the scripts!
 			pattern := regexp.MustCompile(`(?mi)zarf-clean-.+\.sh$`)
-			scripts := utils.RecursiveFileList(config.ZarfCleanupScriptsPath, pattern)
+			scripts, _ := utils.RecursiveFileList(config.ZarfCleanupScriptsPath, pattern)
 			// Iterate over all matching zarf-clean scripts and exec them
 			for _, script := range scripts {
 				// Run the matched script
 				_, _, err := utils.ExecCommandWithContext(context.TODO(), true, script)
 				if errors.Is(err, os.ErrPermission) {
-					message.Warnf("Got a 'permission denied' when trying to execute the script (%v). Are you the right user and/or do you have the right kube-context?\n", script)
+					message.Warnf("Got a 'permission denied' when trying to execute the script (%s). Are you the right user and/or do you have the right kube-context?\n", script)
 
 					// Don't remove scripts we can't execute so the user can try to manually run
 					continue
 				} else if err != nil {
-					message.Debugf("Received error when trying to execute the script (%v): %v", script, err)
+					message.Debugf("Received error when trying to execute the script (%s): %#v", script, err)
 				}
 
 				// Try to remove the script, but ignore any errors
@@ -83,6 +86,7 @@ var destroyCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(destroyCmd)
 
+	// Still going to require a flag for destroy confirm, no viper oopsies here
 	destroyCmd.Flags().BoolVar(&confirmDestroy, "confirm", false, "REQUIRED. Confirm the destroy action to prevent accidental deletions")
 	destroyCmd.Flags().BoolVar(&removeComponents, "remove-components", false, "Also remove any installed components outside the zarf namespace")
 	_ = destroyCmd.MarkFlagRequired("confirm")

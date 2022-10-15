@@ -3,8 +3,11 @@ package message
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pterm/pterm"
 )
@@ -26,11 +29,16 @@ const (
 // NoProgress tracks whether spinner/progress bars show updates
 var NoProgress bool
 
+var SkipLogFile bool
+
 var logLevel = InfoLevel
 
+// Write logs to stderr and a buffer for logfile generation
+var logFile *os.File
+
 func init() {
-	// Help capture text cleaner
-	pterm.SetDefaultOutput(os.Stderr)
+	var err error
+
 	pterm.ThemeDefault.SuccessMessageStyle = *pterm.NewStyle(pterm.FgLightGreen)
 	// Customize default error.
 	pterm.Success.Prefix = pterm.Prefix{
@@ -46,10 +54,43 @@ func init() {
 	}
 
 	pterm.DefaultProgressbar.MaxWidth = 85
+	pterm.SetDefaultOutput(os.Stderr)
+
+	if SkipLogFile {
+		return
+	}
+
+	// Prepend the log filename with a timestampe
+	ts := time.Now().Format("2006-01-02-15-04-05")
+
+	// Try to create a temp log file
+	if logFile, err = os.CreateTemp("", fmt.Sprintf("zarf-%s-*.log", ts)); err != nil {
+		Error(err, "Error saving a log file")
+	} else {
+		// Otherwise fallback to stderr
+		logStream := io.MultiWriter(os.Stderr, logFile)
+		pterm.SetDefaultOutput(logStream)
+		message := fmt.Sprintf("Saving log file to %s", logFile.Name())
+		Note(message)
+	}
 }
 
-func debugPrinter(offset int) *pterm.PrefixPrinter {
-	return pterm.Debug.WithShowLineNumber(logLevel > 2).WithLineNumberOffset(offset)
+func debugPrinter(offset int, a ...any) {
+	printer := pterm.Debug.WithShowLineNumber(logLevel > 2).WithLineNumberOffset(offset)
+	printer.Println(a...)
+
+	// Always write to the log file
+	if logFile != nil && !pterm.PrintDebugMessages {
+		now := time.Now().Format(time.RFC3339)
+		// prepend to a
+		a = append([]any{now, " - "}, a...)
+		pterm.Debug.
+			WithShowLineNumber(true).
+			WithLineNumberOffset(offset).
+			WithDebugger(false).
+			WithWriter(logFile).
+			Println(a...)
+	}
 }
 
 func errorPrinter(offset int) *pterm.PrefixPrinter {
@@ -68,20 +109,28 @@ func GetLogLevel() LogLevel {
 }
 
 func Debug(payload ...any) {
-	debugPrinter(1).Println(payload...)
+	debugPrinter(2, payload...)
 }
 
 func Debugf(format string, a ...any) {
-	debugPrinter(2).Printfln(format, a...)
+	message := fmt.Sprintf(format, a...)
+	debugPrinter(3, message)
 }
 
 func Error(err any, message string) {
-	debugPrinter(1).Println(err)
+	debugPrinter(2, err)
 	Warnf(message)
 }
 
+func ErrorWebf(err any, w http.ResponseWriter, format string, a ...any) {
+	debugPrinter(2, err)
+	message := fmt.Sprintf(format, a...)
+	Warn(message)
+	http.Error(w, message, http.StatusInternalServerError)
+}
+
 func Errorf(err any, format string, a ...any) {
-	debugPrinter(1).Println(err)
+	debugPrinter(2, err)
 	Warnf(format, a...)
 }
 
@@ -95,15 +144,15 @@ func Warnf(format string, a ...any) {
 }
 
 func Fatal(err any, message string) {
-	debugPrinter(1).Println(err)
-	errorPrinter(1).Println(message)
+	debugPrinter(2, err)
+	errorPrinter(2).Println(message)
 	os.Exit(1)
 }
 
 func Fatalf(err any, format string, a ...any) {
-	debugPrinter(1).Println(err)
+	debugPrinter(2, err)
 	message := paragraph(format, a...)
-	errorPrinter(1).Println(message)
+	errorPrinter(2).Println(message)
 	os.Exit(1)
 }
 
@@ -118,10 +167,20 @@ func Infof(format string, a ...any) {
 	}
 }
 
+func SuccessF(format string, a ...any) {
+	message := paragraph(format, a...)
+	pterm.Success.Println(message)
+}
+
 func Question(text string) {
 	pterm.Println()
 	message := paragraph(text)
 	pterm.FgMagenta.Println(message)
+}
+
+func Notef(format string, a ...any) {
+	message := fmt.Sprintf(format, a...)
+	Note(message)
 }
 
 func Note(text string) {
@@ -145,7 +204,7 @@ func HeaderInfof(format string, a ...any) {
 func JsonValue(value any) string {
 	bytes, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		Debugf("ERROR marshalling json: %v", err)
+		Debug(err, "ERROR marshalling json")
 	}
 	return string(bytes)
 }

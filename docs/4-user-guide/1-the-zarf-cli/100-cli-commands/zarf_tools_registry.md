@@ -1,0 +1,30 @@
+## zarf tools registry
+
+Collection of registry commands provided by Crane
+
+### Options
+
+```
+  -h, --help   help for registry
+```
+
+### Options inherited from parent commands
+
+```
+  -a, --architecture string   Architecture for OCI images
+  -l, --log-level string      Log level when running Zarf. Valid options are: warn, info, debug, trace (default "info")
+      --no-log-file           Disable log file creation
+      --no-progress           Disable fancy UI progress bars, spinners, logos, etc
+      --tmpdir string         Specify the temporary directory to use for intermediate files
+      --zarf-cache string     Specify the location of the Zarf cache directory (default "~/.zarf-cache")
+```
+
+### SEE ALSO
+
+* [zarf tools](zarf_tools.md)	 - Collection of additional tools to make airgap easier
+* [zarf tools registry catalog](zarf_tools_registry_catalog.md)	 - List the repos in a registry
+* [zarf tools registry copy](zarf_tools_registry_copy.md)	 - Efficiently copy a remote image from src to dst while retaining the digest value
+* [zarf tools registry login](zarf_tools_registry_login.md)	 - Log in to a registry
+* [zarf tools registry pull](zarf_tools_registry_pull.md)	 - Pull remote images by reference and store their contents locally
+* [zarf tools registry push](zarf_tools_registry_push.md)	 - Push local image contents to a remote registry
+

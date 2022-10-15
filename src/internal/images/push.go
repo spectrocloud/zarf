@@ -8,21 +8,37 @@ import (
 	"github.com/google/go-containerregistry/pkg/crane"
 )
 
-func PushToZarfRegistry(imageTarballPath string, buildImageList []string) error {
-	message.Debugf("images.PushToZarfRegistry(%v, %v)", imageTarballPath, buildImageList)
+// PushToZarfRegistry pushes a provided image into the configured Zarf registry
+// This function will optionally shorten the image name while appending a checksum of the original image name
+func PushToZarfRegistry(imageTarballPath string, buildImageList []string, addChecksum bool) error {
+	message.Debugf("images.PushToZarfRegistry(%s, %s)", imageTarballPath, buildImageList)
 
-	// Establish a registry tunnel to send the images to the zarf registry
-	tunnel := k8s.NewZarfTunnel()
-	tunnel.Connect(k8s.ZarfRegistry, false)
-	defer tunnel.Close()
+	registryUrl := ""
+	if config.GetContainerRegistryInfo().InternalRegistry {
+		// Establish a registry tunnel to send the images to the zarf registry
+		tunnel := k8s.NewZarfTunnel()
+		tunnel.Connect(k8s.ZarfRegistry, false)
+		defer tunnel.Close()
 
-	tunnelUrl := tunnel.Endpoint()
+		registryUrl = tunnel.Endpoint()
+	} else {
+		registryUrl = config.GetContainerRegistryInfo().Address
+
+		// If this is a serviceURL, create a port-forward tunnel to that resource
+		if tunnel, err := k8s.NewTunnelFromServiceURL(registryUrl); err != nil {
+			message.Debug(err)
+		} else {
+			tunnel.Connect("", false)
+			defer tunnel.Close()
+			registryUrl = tunnel.Endpoint()
+		}
+	}
 
 	spinner := message.NewProgressSpinner("Storing images in the zarf registry")
 	defer spinner.Stop()
 
-	pushOptions := config.GetCraneAuthOption(config.ZarfRegistryPushUser, config.GetSecret(config.StateRegistryPush))
-	message.Debug(pushOptions)
+	pushOptions := config.GetCraneAuthOption(config.GetContainerRegistryInfo().PushUsername, config.GetContainerRegistryInfo().PushPassword)
+	message.Debugf("crane pushOptions = %#v", pushOptions)
 
 	for _, src := range buildImageList {
 		spinner.Updatef("Updating image %s", src)
@@ -30,8 +46,18 @@ func PushToZarfRegistry(imageTarballPath string, buildImageList []string) error 
 		if err != nil {
 			return err
 		}
+		offlineName := ""
+		if addChecksum {
+			offlineName, err = utils.SwapHost(src, registryUrl)
+		} else {
+			offlineName, err = utils.SwapHostWithoutChecksum(src, registryUrl)
+		}
+		if err != nil {
+			return err
+		}
 
-		offlineName := utils.SwapHost(src, tunnelUrl)
+		message.Debugf("crane.Push() %s:%s -> %s)", imageTarballPath, src, offlineName)
+
 		if err = crane.Push(img, offlineName, pushOptions); err != nil {
 			return err
 		}

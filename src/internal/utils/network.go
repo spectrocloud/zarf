@@ -20,6 +20,24 @@ func IsUrl(source string) bool {
 	return err == nil && parsedUrl.Scheme != "" && parsedUrl.Host != ""
 }
 
+// DoesHostnamesMatch returns a boolean indicating if the hostname of two different URLs are the same.
+func DoesHostnamesMatch(url1 string, url2 string) (bool, error) {
+	parsedURL1, err := url.Parse(url1)
+	if err != nil {
+		message.Debugf("unable to parse the url (%s)", url1)
+
+		return false, err
+	}
+	parsedURL2, err := url.Parse(url2)
+	if err != nil {
+		message.Debugf("unable to parse the url (%s)", url2)
+
+		return false, err
+	}
+
+	return parsedURL1.Hostname() == parsedURL2.Hostname(), nil
+}
+
 func Fetch(url string) io.ReadCloser {
 	// Get the data
 	resp, err := http.Get(url)
@@ -36,6 +54,11 @@ func Fetch(url string) io.ReadCloser {
 }
 
 func DownloadToFile(url string, target string, cosignKeyPath string) {
+
+	// Always ensure the target directory exists
+	if err := CreateFilePath(target); err != nil {
+		message.Fatalf(err, "Unable to create file path: %s", target)
+	}
 
 	// Create the file
 	destinationFile, err := os.Create(target)

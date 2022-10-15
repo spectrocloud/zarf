@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/defenseunicorns/zarf/src/types"
 	"github.com/pterm/pterm"
+	"gopkg.in/yaml.v2"
 
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/defenseunicorns/zarf/src/config"
@@ -39,19 +39,24 @@ type tempPaths struct {
 	images           string
 	components       string
 	sboms            string
+	zarfYaml         string
 }
 
 func createPaths() tempPaths {
-	basePath, _ := utils.MakeTempDir()
+	basePath, err := utils.MakeTempDir(config.CommonOptions.TempDirectory)
+	if err != nil {
+		message.Fatalf(err, "Unable to create tmpdir:  %s", config.CommonOptions.TempDirectory)
+	}
 	return tempPaths{
 		base: basePath,
 
-		injectZarfBinary: basePath + "/zarf-registry",
-		injectBinary:     basePath + "/zarf-injector",
-		seedImage:        basePath + "/seed-image.tar",
-		images:           basePath + "/images.tar",
-		components:       basePath + "/components",
-		sboms:            basePath + "/sboms",
+		injectZarfBinary: filepath.Join(basePath, "zarf-registry"),
+		injectBinary:     filepath.Join(basePath, "zarf-injector"),
+		seedImage:        filepath.Join(basePath, "seed-image.tar"),
+		images:           filepath.Join(basePath, "images.tar"),
+		components:       filepath.Join(basePath, "components"),
+		sboms:            filepath.Join(basePath, "sboms"),
+		zarfYaml:         filepath.Join(basePath, "zarf.yaml"),
 	}
 }
 
@@ -62,21 +67,23 @@ func (t tempPaths) clean() {
 }
 
 func createComponentPaths(basePath string, component types.ZarfComponent) componentPaths {
-	basePath = basePath + "/" + component.Name
+	basePath = filepath.Join(basePath, component.Name)
 	_ = utils.CreateDirectory(basePath, 0700)
 	return componentPaths{
 		base:           basePath,
-		files:          basePath + "/files",
-		charts:         basePath + "/charts",
-		repos:          basePath + "/repos",
-		manifests:      basePath + "/manifests",
-		dataInjections: basePath + "/data",
-		values:         basePath + "/values",
+		files:          filepath.Join(basePath, "files"),
+		charts:         filepath.Join(basePath, "charts"),
+		repos:          filepath.Join(basePath, "repos"),
+		manifests:      filepath.Join(basePath, "manifests"),
+		dataInjections: filepath.Join(basePath, "data"),
+		values:         filepath.Join(basePath, "values"),
 	}
 }
 
-func confirmAction(configPath, userMessage string, sbomViewFiles []string) bool {
-	content, err := ioutil.ReadFile(configPath)
+func confirmAction(userMessage string, sbomViewFiles []string) bool {
+	active := config.GetActiveConfig()
+
+	content, err := yaml.Marshal(active)
 	if err != nil {
 		message.Fatal(err, "Unable to open the package config file")
 	}
@@ -98,14 +105,17 @@ func confirmAction(configPath, userMessage string, sbomViewFiles []string) bool 
 
 	// Display prompt if not auto-confirmed
 	var confirmFlag bool
-	if config.DeployOptions.Confirm {
-		message.Infof("%s Zarf package confirmed", userMessage)
-		return config.DeployOptions.Confirm
+	if config.CommonOptions.Confirm {
+		message.SuccessF("%s Zarf package confirmed", userMessage)
+
+		return config.CommonOptions.Confirm
 	} else {
 		prompt := &survey.Confirm{
 			Message: userMessage + " this Zarf package?",
 		}
-		_ = survey.AskOne(prompt, &confirmFlag)
+		if err := survey.AskOne(prompt, &confirmFlag); err != nil {
+			message.Fatalf(nil, "Confirm selection canceled: %s", err.Error())
+		}
 	}
 
 	return confirmFlag

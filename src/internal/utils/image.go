@@ -1,12 +1,72 @@
 package utils
 
-import "regexp"
+import (
+	"fmt"
+	"hash/crc32"
 
-// For further explanation see https://regex101.com/library/PiL191 and https://regex101.com/r/PiL191/1
-var hostParser = regexp.MustCompile(`(?im)^([a-z0-9\-.]+\.[a-z0-9\-]+:?[0-9]*)?/?(.+)$`)
+	"github.com/distribution/distribution/v3/reference"
+)
 
-// SwapHost Perform base url replacment without the docker libs
-func SwapHost(src string, targetHost string) string {
-	var substitution = targetHost + "/$2"
-	return hostParser.ReplaceAllString(src, substitution)
+type Image struct {
+	Host        string
+	Name        string
+	Path        string
+	Tag         string
+	Digest      string
+	Reference   string
+	TagOrDigest string
+}
+
+// SwapHost Perform base url replacement and adds a crc32 of the original url to the end of the src
+func SwapHost(src string, targetHost string) (string, error) {
+	image, err := ParseImageURL(src)
+	if err != nil {
+		return "", err
+	}
+
+	// Generate a crc32 hash of the image host + name
+	table := crc32.MakeTable(crc32.IEEE)
+	checksum := crc32.Checksum([]byte(image.Name), table)
+
+	return fmt.Sprintf("%s/%s-%d%s", targetHost, image.Path, checksum, image.TagOrDigest), nil
+}
+
+// SwapHostWithoutChecksum Perform base url replacement but avoids adding a checksum of the original url.
+func SwapHostWithoutChecksum(src string, targetHost string) (string, error) {
+	image, err := ParseImageURL(src)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s/%s%s", targetHost, image.Path, image.TagOrDigest), nil
+}
+
+func ParseImageURL(src string) (out Image, err error) {
+	ref, err := reference.ParseAnyReference(src)
+	if err != nil {
+		return out, err
+	}
+
+	// Parse the reference into its components
+	if named, ok := ref.(reference.Named); ok {
+		out.Name = named.Name()
+		out.Path = reference.Path(named)
+		out.Host = reference.Domain(named)
+		out.Reference = ref.String()
+	} else {
+		return out, fmt.Errorf("unable to parse image name from %s", src)
+	}
+
+	// Parse the tag and add it to digestOrReference
+	if tagged, ok := ref.(reference.Tagged); ok {
+		out.Tag = tagged.Tag()
+		out.TagOrDigest = fmt.Sprintf(":%s", tagged.Tag())
+	}
+
+	// Parse the digest and override digestOrReference
+	if digested, ok := ref.(reference.Digested); ok {
+		out.Digest = digested.Digest().String()
+		out.TagOrDigest = fmt.Sprintf("@%s", digested.Digest().String())
+	}
+
+	return out, nil
 }

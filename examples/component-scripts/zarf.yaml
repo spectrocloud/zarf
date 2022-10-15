@@ -4,14 +4,22 @@ metadata:
   description: "Test component to demonstrate script timeout feature"
 
 components:
-  # This script will pass after 1 second
-  - name: passes
+  - name: prepare
+    scripts:
+      # Note this file will be created in this directory, regardless of where the package create command is called from
+      prepare:
+        # on Windows, touch is replaced with New-Item
+        - "touch test-prepare.txt"
+
+  - name: deploy
     scripts:
       before:
-        - "sleep 1"
+        - "touch test-deploy-before.txt"
+      after:
+        - "touch test-deploy-after.txt"
 
   # This script will fail after 1 seconds
-  - name: fails
+  - name: timeout
     scripts:
       timeoutSeconds: 1
       before:

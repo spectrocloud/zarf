@@ -1,6 +1,7 @@
 package config
 
 import (
+	"embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,13 +25,15 @@ const (
 	PackagePrefix = "zarf-package"
 
 	// ZarfMaxChartNameLength limits helm chart name size to account for K8s/helm limits and zarf prefix
-	ZarfMaxChartNameLength  = 40
-	ZarfGitPushUser         = "zarf-git-user"
-	ZarfGitReadUser         = "zarf-git-read-user"
-	ZarfRegistryPushUser    = "zarf-push"
-	ZarfRegistryPullUser    = "zarf-pull"
-	ZarfImagePullSecretName = "private-registry"
-	ZarfGitServerSecretName = "private-git-server"
+	ZarfMaxChartNameLength   = 40
+	ZarfGitPushUser          = "zarf-git-user"
+	ZarfGitReadUser          = "zarf-git-read-user"
+	ZarfRegistryPushUser     = "zarf-push"
+	ZarfRegistryPullUser     = "zarf-pull"
+	ZarfImagePullSecretName  = "private-registry"
+	ZarfGitServerSecretName  = "private-git-server"
+	ZarfGeneratedPasswordLen = 24
+	ZarfGeneratedSecretLen   = 48
 
 	ZarfAgentHost = "agent-hook.zarf.svc"
 
@@ -38,16 +41,29 @@ const (
 	ZarfConnectAnnotationDescription = "zarf.dev/connect-description"
 	ZarfConnectAnnotationUrl         = "zarf.dev/connect-url"
 
-	ZarfManagedByLabel        = "app.kubernetes.io/managed-by"
-	ZarfCleanupScriptsPath    = "/opt/zarf"
-	ZarfDefaultImageCachePath = ".zarf-image-cache"
+	ZarfManagedByLabel     = "app.kubernetes.io/managed-by"
+	ZarfCleanupScriptsPath = "/opt/zarf"
 
-	ZarfYAML = "zarf.yaml"
+	ZarfImageCacheDir = "images"
+	ZarfGitCacheDir   = "repos"
+
+	ZarfYAML    = "zarf.yaml"
+	ZarfSBOMDir = "zarf-sbom"
+
+	ZarfInClusterContainerRegistryURL      = "http://zarf-registry-http.zarf.svc.cluster.local:5000"
+	ZarfInClusterContainerRegistryNodePort = 31999
+
+	ZarfInClusterGitServiceURL = "http://zarf-gitea-http.zarf.svc.cluster.local:3000"
+
+	ZarfSeedImage = "registry:2.8.1"
 )
 
 var (
 	// CLIVersion track the version of the CLI
 	CLIVersion = "unset"
+
+	// CommonOptions tracks user-defined values that apply across commands.
+	CommonOptions types.ZarfCommonOptions
 
 	// CreeateOptions tracks the user-defined options used to create the package
 	CreateOptions types.ZarfCreateOptions
@@ -55,18 +71,44 @@ var (
 	// DeployOptions tracks user-defined values for the active deployment
 	DeployOptions types.ZarfDeployOptions
 
+	// InitOptions tracks user-defined values for the active Zarf initialization.
+	InitOptions types.ZarfInitOptions
+
+	// CliArch is the computer architecture of the device executing the CLI commands
 	GenerateOptions types.ZarfGenerateOptions
 
 	CliArch string
 
+	// ZarfSeedPort is the NodePort Zarf uses for the 'seed registry'
 	ZarfSeedPort string
 
 	// Private vars
 	active types.ZarfPackage
-	state  types.ZarfState
+	// Dirty Solution to getting the real time deployedComponents components.
+	deployedComponents []types.DeployedComponent
+	state              types.ZarfState
 
 	SGetPublicKey string
+	UIAssets      embed.FS
+
+	// Variables set by the user
+	SetVariableMap map[string]string
+
+	// Timestamp of when the CLI was started
+	operationStartTime  = time.Now().Unix()
+	dataInjectionMarker = ".zarf-injection-%d"
+
+	ZarfDefaultCachePath = filepath.Join("~", ".zarf-cache")
 )
+
+// Timestamp of when the CLI was started
+func GetStartTime() int64 {
+	return operationStartTime
+}
+
+func GetDataInjectionMarker() string {
+	return fmt.Sprintf(dataInjectionMarker, operationStartTime)
+}
 
 func IsZarfInitConfig() bool {
 	message.Debug("config.IsZarfInitConfig")
@@ -121,24 +163,13 @@ func GetSeedRegistry() string {
 	return fmt.Sprintf("%s:%s", IPV4Localhost, ZarfSeedPort)
 }
 
-// GetSeedImage returns a list of image strings specified in the package, but only for init packages
-func GetSeedImage() string {
-	message.Debugf("config.GetSeedImage()")
-	// Only allow seed images for init config
-	if IsZarfInitConfig() {
-		return active.Seed
-	} else {
-		return ""
-	}
-}
-
 func GetPackageName() string {
 	metadata := GetMetaData()
 	prefix := PackagePrefix
 	suffix := "tar.zst"
 
 	if IsZarfInitConfig() {
-		return fmt.Sprintf("zarf-init-%s.tar.zst", GetArch())
+		return GetInitPackageName()
 	}
 
 	if metadata.Uncompressed {
@@ -147,12 +178,28 @@ func GetPackageName() string {
 	return fmt.Sprintf("%s-%s-%s.%s", prefix, metadata.Name, GetArch(), suffix)
 }
 
+func GetInitPackageName() string {
+	return fmt.Sprintf("zarf-init-%s-%s.tar.zst", GetArch(), CLIVersion)
+}
+
 func GetMetaData() types.ZarfMetadata {
 	return active.Metadata
 }
 
 func GetComponents() []types.ZarfComponent {
 	return active.Components
+}
+
+func GetDeployingComponents() []types.DeployedComponent {
+	return deployedComponents
+}
+
+func SetDeployingComponents(components []types.DeployedComponent) {
+	deployedComponents = components
+}
+
+func ClearDeployingComponents() {
+	deployedComponents = []types.DeployedComponent{}
 }
 
 func SetComponents(components []types.ZarfComponent) {
@@ -170,7 +217,6 @@ func GetValidPackageExtensions() [3]string {
 func InitState(tmpState types.ZarfState) {
 	message.Debugf("config.InitState()")
 	state = tmpState
-	initSecrets()
 }
 
 func GetState() types.ZarfState {
@@ -178,19 +224,60 @@ func GetState() types.ZarfState {
 }
 
 func GetRegistry() string {
-	return fmt.Sprintf("%s:%s", IPV4Localhost, state.NodePort)
+	// If a node port is populated, then we are using a registry internal to the cluster. Ignore the provided address and use localhost
+	if state.RegistryInfo.NodePort >= 30000 {
+		return fmt.Sprintf("%s:%d", IPV4Localhost, state.RegistryInfo.NodePort)
+	}
+
+	return state.RegistryInfo.Address
 }
 
-func LoadConfig(path string) error {
-	return utils.ReadYaml(path, &active)
+// LoadConfig loads the config from the given path and removes
+// components not matching the current OS if filterByOS is set.
+func LoadConfig(path string, filterByOS bool) error {
+	if err := utils.ReadYaml(path, &active); err != nil {
+		return err
+	}
+
+	// Filter each component to only compatible platforms
+	filteredComponents := []types.ZarfComponent{}
+	for _, component := range active.Components {
+		if isCompatibleComponent(component, filterByOS) {
+			filteredComponents = append(filteredComponents, component)
+		}
+	}
+	// Update the active package with the filtered components
+	active.Components = filteredComponents
+
+	return nil
 }
 
+func GetActiveConfig() types.ZarfPackage {
+	return active
+}
+
+// GetGitServerInfo returns the GitServerInfo for the git server Zarf is configured to use from the state
+func GetGitServerInfo() types.GitServerInfo {
+	return state.GitServer
+}
+
+// GetContainerRegistryInfo returns the ContainerRegistryInfo for the docker registry Zarf is configured to use from the state
+func GetContainerRegistryInfo() types.RegistryInfo {
+	return state.RegistryInfo
+}
+
+// BuildConfig adds build information and writes the config to the given path
 func BuildConfig(path string) error {
 	message.Debugf("config.BuildConfig(%s)", path)
 	now := time.Now()
 	// Just use $USER env variable to avoid CGO issue
 	// https://groups.google.com/g/golang-dev/c/ZFDDX3ZiJ84
-	currentUser := os.Getenv("USER")
+	// Record the name of the user creating the package
+	if runtime.GOOS == "windows" {
+		active.Build.User = os.Getenv("USERNAME")
+	} else {
+		active.Build.User = os.Getenv("USER")
+	}
 	hostname, hostErr := os.Hostname()
 
 	// Need to ensure the arch is updated if injected
@@ -211,22 +298,40 @@ func BuildConfig(path string) error {
 		active.Build.Terminal = hostname
 	}
 
-	// Record the name of the user creating the package
-	active.Build.User = currentUser
-
 	return utils.WriteYaml(path, active, 0400)
 }
 
-func SetImageCachePath(cachePath string) {
-	CreateOptions.ImageCachePath = cachePath
-}
-
-func GetImageCachePath() string {
+// GetAbsCachePath gets the absolute cache path for images and git repos.
+func GetAbsCachePath() string {
 	homePath, _ := os.UserHomeDir()
 
-	if CreateOptions.ImageCachePath == "" {
-		return filepath.Join(homePath, ZarfDefaultImageCachePath)
+	if strings.HasPrefix(CommonOptions.CachePath, "~") {
+		return strings.Replace(CommonOptions.CachePath, "~", homePath, 1)
+	}
+	return CommonOptions.CachePath
+}
+
+func isCompatibleComponent(component types.ZarfComponent, filterByOS bool) bool {
+	message.Debugf("config.isCompatibleComponent(%s, %v)", component.Name, filterByOS)
+
+	// Ignore only filters that are empty
+	var validArch, validOS bool
+
+	targetArch := GetArch()
+
+	// Test for valid architecture
+	if component.Only.Cluster.Architecture == "" || component.Only.Cluster.Architecture == targetArch {
+		validArch = true
+	} else {
+		message.Debugf("Skipping component %s, %s is not compatible with %s", component.Name, component.Only.Cluster.Architecture, targetArch)
 	}
 
-	return strings.Replace(CreateOptions.ImageCachePath, "~", homePath, 1)
+	// Test for a valid OS
+	if !filterByOS || component.Only.LocalOS == "" || component.Only.LocalOS == runtime.GOOS {
+		validOS = true
+	} else {
+		message.Debugf("Skipping component %s, %s is not compatible with %s", component.Name, component.Only.LocalOS, runtime.GOOS)
+	}
+
+	return validArch && validOS
 }

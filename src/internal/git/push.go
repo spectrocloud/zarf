@@ -1,9 +1,9 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/defenseunicorns/zarf/src/config"
 	"github.com/defenseunicorns/zarf/src/internal/k8s"
@@ -11,6 +11,7 @@ import (
 	"github.com/defenseunicorns/zarf/src/internal/utils"
 	"github.com/go-git/go-git/v5"
 	goConfig "github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 )
 
@@ -18,12 +19,17 @@ const offlineRemoteName = "offline-downstream"
 const onlineRemoteRefPrefix = "refs/remotes/" + onlineRemoteName + "/"
 
 func PushAllDirectories(localPath string) error {
-	// Establish a git tunnel to send the repos
-	tunnel := k8s.NewZarfTunnel()
-	tunnel.Connect(k8s.ZarfGit, false)
-	defer tunnel.Close()
+	gitServerInfo := config.GetGitServerInfo()
+	gitServerURL := gitServerInfo.Address
 
-	tunnelUrl := fmt.Sprintf("http://%s", tunnel.Endpoint())
+	// If this is a serviceURL, create a port-forward tunnel to that resource
+	if tunnel, err := k8s.NewTunnelFromServiceURL(gitServerURL); err != nil {
+		message.Debug(err)
+	} else {
+		tunnel.Connect("", false)
+		defer tunnel.Close()
+		gitServerURL = fmt.Sprintf("http://%s", tunnel.Endpoint())
+	}
 
 	paths, err := utils.ListDirectories(localPath)
 	if err != nil {
@@ -37,19 +43,38 @@ func PushAllDirectories(localPath string) error {
 	for _, path := range paths {
 		basename := filepath.Base(path)
 		spinner.Updatef("Pushing git repo %s", basename)
-		if err := push(path, tunnelUrl, spinner); err != nil {
+
+		repo, err := prepRepoForPush(path, gitServerURL, gitServerInfo.PushUsername)
+		if err != nil {
+			message.Warnf("error when preping the repo for push.. %v", err)
+			return err
+		}
+
+		if err := push(repo, path, spinner); err != nil {
 			spinner.Warnf("Unable to push the git repo %s", basename)
 			return err
 		}
 
 		// Add the read-only user to this repo
-		repoPathSplit := strings.Split(path, "/")
-		repoNameWithGitTag := repoPathSplit[len(repoPathSplit)-1]
-		repoName := strings.Split(repoNameWithGitTag, ".git")[0]
-		err = addReadOnlyUserToRepo(tunnelUrl, repoName)
-		if err != nil {
-			message.Warnf("Unable to add the read-only user to the repo: %v\n", repoName)
-			return err
+		if gitServerInfo.InternalServer {
+			// Get the upstream URL
+			remote, err := repo.Remote(onlineRemoteName)
+			if err != nil {
+				message.Warn("unable to get the information needed to add the read-only user to the repo")
+				return err
+			}
+			remoteUrl := remote.Config().URLs[0]
+			repoName, err := transformURLtoRepoName(remoteUrl)
+			if err != nil {
+				message.Warnf("Unable to add the read-only user to the repo: %s\n", repoName)
+				return err
+			}
+
+			err = addReadOnlyUserToRepo(gitServerURL, repoName)
+			if err != nil {
+				message.Warnf("Unable to add the read-only user to the repo: %s\n", repoName)
+				return err
+			}
 		}
 	}
 
@@ -57,35 +82,40 @@ func PushAllDirectories(localPath string) error {
 	return nil
 }
 
-func push(localPath, tunnelUrl string, spinner *message.Spinner) error {
-
+func prepRepoForPush(localPath, tunnelUrl, username string) (*git.Repository, error) {
 	// Open the given repo
 	repo, err := git.PlainOpen(localPath)
 	if err != nil {
-		return fmt.Errorf("not a valid git repo or unable to open: %w", err)
+		return nil, fmt.Errorf("not a valid git repo or unable to open: %w", err)
 	}
 
 	// Get the upstream URL
 	remote, err := repo.Remote(onlineRemoteName)
 	if err != nil {
-		return fmt.Errorf("unable to find the git remote: %w", err)
-
+		return nil, fmt.Errorf("unable to find the git remote: %w", err)
 	}
+
 	remoteUrl := remote.Config().URLs[0]
-	targetUrl := transformURL(tunnelUrl, remoteUrl)
+	targetUrl, err := transformURL(tunnelUrl, remoteUrl, username)
+	if err != nil {
+		return nil, fmt.Errorf("unable to transform the git url: %w", err)
+	}
 
 	_, err = repo.CreateRemote(&goConfig.RemoteConfig{
 		Name: offlineRemoteName,
 		URLs: []string{targetUrl},
 	})
-
 	if err != nil {
-		return fmt.Errorf("failed to create offline remote: %w", err)
+		return nil, fmt.Errorf("failed to create offline remote: %w", err)
 	}
 
+	return repo, nil
+}
+
+func push(repo *git.Repository, localPath string, spinner *message.Spinner) error {
 	gitCred := http.BasicAuth{
-		Username: config.ZarfGitPushUser,
-		Password: config.GetSecret(config.StateGitPush),
+		Username: config.GetState().GitServer.PushUsername,
+		Password: config.GetState().GitServer.PushPassword,
 	}
 
 	// Since we are pushing HEAD:refs/heads/master on deployment, leaving
@@ -96,6 +126,30 @@ func push(localPath, tunnelUrl string, spinner *message.Spinner) error {
 		return fmt.Errorf("unable to remove unused git refs from the repo: %w", err)
 	}
 
+	// Fetch remote offline refs in case of old update or if multiple refs are specified in one package
+	fetchOptions := &git.FetchOptions{
+		RemoteName: offlineRemoteName,
+		Auth:       &gitCred,
+		RefSpecs: []goConfig.RefSpec{
+			"refs/heads/*:refs/heads/*",
+			onlineRemoteRefPrefix + "*:refs/heads/*",
+			"refs/tags/*:refs/tags/*",
+		},
+	}
+
+	// Attempt the fetch, if it fails, log a warning and continue trying to push (might as well try..)
+	err = repo.Fetch(fetchOptions)
+	if errors.Is(err, transport.ErrRepositoryNotFound) {
+		message.Debugf("Repo not yet available offline, skipping fetch...")
+	} else if errors.Is(err, git.ErrForceNeeded) {
+		message.Debugf("Repo fetch requires force, skipping fetch...")
+	} else if errors.Is(err, git.NoErrAlreadyUpToDate) {
+		message.Debugf("Repo already up-to-date, skipping fetch...")
+	} else if err != nil {
+		message.Warnf("unable to fetch remote cleanly prior to push: %#v", err)
+	}
+
+	// Push all heads and tags to the offline remote
 	err = repo.Push(&git.PushOptions{
 		RemoteName: offlineRemoteName,
 		Auth:       &gitCred,
@@ -108,7 +162,7 @@ func push(localPath, tunnelUrl string, spinner *message.Spinner) error {
 		},
 	})
 
-	if err == git.NoErrAlreadyUpToDate {
+	if errors.Is(err, git.NoErrAlreadyUpToDate) {
 		spinner.Debugf("Repo already up-to-date")
 	} else if err != nil {
 		return fmt.Errorf("unable to push repo to the gitops service: %w", err)

@@ -1,15 +1,17 @@
 package helm
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
+	"github.com/defenseunicorns/zarf/src/config"
 	"github.com/defenseunicorns/zarf/src/types"
 
 	"github.com/defenseunicorns/zarf/src/internal/message"
 	"helm.sh/helm/v3/pkg/action"
-	corev1 "k8s.io/api/core/v1"
 
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/release"
@@ -27,7 +29,8 @@ type ChartOptions struct {
 }
 
 // InstallOrUpgradeChart performs a helm install of the given chart
-func InstallOrUpgradeChart(options ChartOptions) types.ConnectStrings {
+func InstallOrUpgradeChart(options ChartOptions) (types.ConnectStrings, string) {
+	var installedChartName string
 	fromMessage := options.Chart.Url
 	if fromMessage == "" {
 		fromMessage = "Zarf-generated helm chart"
@@ -40,11 +43,18 @@ func InstallOrUpgradeChart(options ChartOptions) types.ConnectStrings {
 
 	var output *release.Release
 
+	options.ReleaseName = fmt.Sprintf("zarf-%s", options.Chart.Name)
 	if options.Chart.ReleaseName != "" {
 		options.ReleaseName = fmt.Sprintf("zarf-%s", options.Chart.ReleaseName)
-	} else {
-		options.ReleaseName = fmt.Sprintf("zarf-%s", options.Chart.Name)
 	}
+	installedChartName = options.ReleaseName
+
+	// Do not wait for the chart to be ready if data injections are present
+	if len(options.Component.DataInjections) > 0 {
+		spinner.Updatef("Data injections detected, not waiting for chart to be ready")
+		options.Chart.NoWait = true
+	}
+
 	actionConfig, err := createActionConfig(options.Chart.Namespace, spinner)
 	postRender := NewRenderer(options, actionConfig)
 
@@ -61,7 +71,7 @@ func InstallOrUpgradeChart(options ChartOptions) types.ConnectStrings {
 		histClient := action.NewHistory(actionConfig)
 		histClient.Max = 1
 
-		if attempt > 2 {
+		if attempt > 4 {
 			// On total failure try to rollback or uninstall
 			if histClient.Version > 1 {
 				spinner.Updatef("Performing chart rollback")
@@ -70,7 +80,7 @@ func InstallOrUpgradeChart(options ChartOptions) types.ConnectStrings {
 				spinner.Updatef("Performing chart uninstall")
 				_, _ = uninstallChart(actionConfig, options.ReleaseName)
 			}
-			spinner.Errorf(nil, "Unable to complete helm chart install/upgrade")
+			spinner.Fatalf(nil, "Unable to complete helm chart install/upgrade")
 			break
 		}
 
@@ -91,7 +101,7 @@ func InstallOrUpgradeChart(options ChartOptions) types.ConnectStrings {
 
 		default:
 			// 😭 things aren't working
-			spinner.Fatalf(err, "Unable to verify the chart installation status")
+			spinner.Fatalf(histErr, "Unable to verify the chart installation status")
 		}
 
 		if err != nil {
@@ -107,7 +117,7 @@ func InstallOrUpgradeChart(options ChartOptions) types.ConnectStrings {
 	}
 
 	// return any collected connect strings for zarf connect
-	return postRender.connectStrings
+	return postRender.connectStrings, installedChartName
 }
 
 // TemplateChart generates a helm template from a given chart
@@ -156,45 +166,47 @@ func TemplateChart(options ChartOptions) (string, error) {
 	return templatedChart.Manifest, nil
 }
 
-func GenerateChart(basePath string, manifest types.ZarfManifest, component types.ZarfComponent) types.ConnectStrings {
+// GenerateChart generates a helm chart for a given Zarf manifest.
+func GenerateChart(basePath string, manifest types.ZarfManifest, component types.ZarfComponent) (types.ConnectStrings, string) {
 	message.Debugf("helm.GenerateChart(%s, %#v, %s)", basePath, manifest, component.Name)
 	spinner := message.NewProgressSpinner("Starting helm chart generation %s", manifest.Name)
 	defer spinner.Stop()
 
-	// Use timestamp to help make a valid semver
-	now := time.Now()
-
 	// Generate a new chart
 	tmpChart := new(chart.Chart)
 	tmpChart.Metadata = new(chart.Metadata)
-	tmpChart.Metadata.Name = fmt.Sprintf("raw-%s", manifest.Name)
+
+	// Generate a hashed chart name
+	rawChartName := fmt.Sprintf("raw-%s-%s-%s", config.GetActiveConfig().Metadata.Name, component.Name, manifest.Name)
+	hasher := sha1.New()
+	hasher.Write([]byte(rawChartName))
+	tmpChart.Metadata.Name = rawChartName
+	sha1ReleaseName := hex.EncodeToString(hasher.Sum(nil))
+
 	// This is fun, increment forward in a semver-way using epoch so helm doesn't cry
-	tmpChart.Metadata.Version = fmt.Sprintf("0.1.%d", now.Unix())
+	tmpChart.Metadata.Version = fmt.Sprintf("0.1.%d", config.GetStartTime())
 	tmpChart.Metadata.APIVersion = chart.APIVersionV1
 
 	// Add the manifest files so helm does its thing
 	for _, file := range manifest.Files {
 		spinner.Updatef("Processing %s", file)
 		manifest := fmt.Sprintf("%s/%s", basePath, file)
-		data, err := ioutil.ReadFile(manifest)
+		data, err := os.ReadFile(manifest)
 		if err != nil {
 			spinner.Fatalf(err, "Unable to read the manifest file contents")
 		}
 		tmpChart.Templates = append(tmpChart.Templates, &chart.File{Name: manifest, Data: data})
 	}
 
-	if manifest.DefaultNamespace == "" {
-		// Helm gets sad when you don't provide a namespace even though we aren't using helm templating
-		manifest.DefaultNamespace = corev1.NamespaceDefault
-	}
-
 	// Generate the struct to pass to InstallOrUpgradeChart()
 	options := ChartOptions{
 		BasePath: basePath,
 		Chart: types.ZarfChart{
-			Name:      tmpChart.Metadata.Name,
-			Version:   tmpChart.Metadata.Version,
-			Namespace: manifest.DefaultNamespace,
+			Name:        tmpChart.Metadata.Name,
+			ReleaseName: sha1ReleaseName,
+			Version:     tmpChart.Metadata.Version,
+			Namespace:   manifest.Namespace,
+			NoWait:      manifest.NoWait,
 		},
 		ChartOverride: tmpChart,
 		// We don't have any values because we do not expose them in the zarf.yaml currently
@@ -213,10 +225,11 @@ func installChart(actionConfig *action.Configuration, options ChartOptions, post
 	// Bind the helm action
 	client := action.NewInstall(actionConfig)
 
-	// Let each chart run for 5 minutes
+	// Let each chart run for 15 minutes
 	client.Timeout = 15 * time.Minute
 
-	client.Wait = true
+	// Default helm behavior for Zarf is to wait for the resources to deploy, NoWait overrides that for special cases (such as data-injection)
+	client.Wait = !options.Chart.NoWait
 
 	// We need to include CRDs or operator installations will fail spectacularly
 	client.SkipCRDs = false
@@ -243,10 +256,11 @@ func upgradeChart(actionConfig *action.Configuration, options ChartOptions, post
 	message.Debugf("helm.upgradeChart(%#v, %#v, %#v)", actionConfig, options, postRender)
 	client := action.NewUpgrade(actionConfig)
 
-	// Let each chart run for 5 minutes
-	client.Timeout = 10 * time.Minute
+	// Let each chart run for 15 minutes
+	client.Timeout = 15 * time.Minute
 
-	client.Wait = true
+	// Default helm behavior for Zarf is to wait for the resources to deploy, NoWait overrides that for special cases (such as data-injection)k3
+	client.Wait = !options.Chart.NoWait
 
 	client.SkipCRDs = true
 

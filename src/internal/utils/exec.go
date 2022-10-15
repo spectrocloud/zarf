@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"sync"
 )
 
@@ -17,8 +18,13 @@ const colorGreen = "\x1b[32;1m"
 const colorCyan = "\x1b[36;1m"
 const colorWhite = "\x1b[37;1m"
 
-//nolint
+// ExecCommandWithContext executes a given command with args in the current working directory.
 func ExecCommandWithContext(ctx context.Context, showLogs bool, commandName string, args ...string) (string, string, error) {
+	return ExecCommandWithContextAndDir(ctx, "", showLogs, commandName, args...)
+}
+
+// ExecCommandWithContextAndDir executes a given command with args in the specified directory.
+func ExecCommandWithContextAndDir(ctx context.Context, dir string, showLogs bool, commandName string, args ...string) (string, string, error) {
 	if showLogs {
 		fmt.Println()
 		fmt.Printf("  %s", colorGreen)
@@ -34,6 +40,7 @@ func ExecCommandWithContext(ctx context.Context, showLogs bool, commandName stri
 
 	env := os.Environ()
 	cmd.Env = env
+	cmd.Dir = dir
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	stdoutIn, _ := cmd.StdoutPipe()
@@ -71,4 +78,17 @@ func ExecCommandWithContext(ctx context.Context, showLogs bool, commandName stri
 	}
 
 	return stdoutBuf.String(), stderrBuf.String(), nil
+}
+
+func ExecLaunchURL(url string) error {
+	switch runtime.GOOS {
+	case "linux":
+		return exec.Command("xdg-open", url).Start()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		return exec.Command("open", url).Start()
+	}
+
+	return nil
 }

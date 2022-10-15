@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 
 	"github.com/defenseunicorns/zarf/src/config"
@@ -43,8 +44,11 @@ func NewRenderer(options ChartOptions, actionConfig *action.Configuration) *rend
 func (r *renderer) Run(renderedManifests *bytes.Buffer) (*bytes.Buffer, error) {
 	message.Debugf("helm.Run(renderedManifests *bytes.Buffer)")
 	// This is very low cost and consistent for how we replace elsewhere, also good for debugging
-	tempDir, _ := utils.MakeTempDir()
-	path := tempDir + "/chart.yaml"
+	tempDir, err := utils.MakeTempDir(config.CommonOptions.TempDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create tmpdir:  %w", err)
+	}
+	path := filepath.Join(tempDir, "chart.yaml")
 
 	// Write the context to a file for processing
 	if err := utils.WriteFile(path, renderedManifests.Bytes()); err != nil {
@@ -171,8 +175,8 @@ func (r *renderer) Run(renderedManifests *bytes.Buffer) (*bytes.Buffer, error) {
 			// Generate the git server secret
 			gitServerSecret := k8s.GenerateSecret(name, config.ZarfGitServerSecretName, corev1.SecretTypeOpaque)
 			gitServerSecret.StringData = map[string]string{
-				"username": config.ZarfGitReadUser,
-				"password": config.GetSecret(config.StateGitPull),
+				"username": config.GetGitServerInfo().PullUsername,
+				"password": config.GetGitServerInfo().PullPassword,
 			}
 
 			// Update the git server secret

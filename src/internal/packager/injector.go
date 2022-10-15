@@ -3,8 +3,8 @@ package packager
 import (
 	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"regexp"
 	"time"
 
@@ -23,10 +23,10 @@ import (
 var payloadChunkSize = 1024 * 512
 
 func runInjectionMadness(tempPath tempPaths) {
-	message.Debugf("packager.runInjectionMadness(%v)", tempPath)
+	message.Debugf("packager.runInjectionMadness(%#v)", tempPath)
 
 	spinner := message.NewProgressSpinner("Attempting to bootstrap the seed image into the cluster")
-	defer spinner.Stop()
+	defer spinner.Success()
 
 	var err error
 	var images k8s.ImageNodeMap
@@ -37,35 +37,35 @@ func runInjectionMadness(tempPath tempPaths) {
 	// Try to create the zarf namespace
 	spinner.Updatef("Creating the Zarf namespace")
 	if _, err := k8s.CreateNamespace(k8s.ZarfNamespace, nil); err != nil {
-		message.Fatal(err, "Unable to create the zarf namespace")
+		spinner.Fatalf(err, "Unable to create the zarf namespace")
 	}
 
 	// Get all the images from the cluster
 	spinner.Updatef("Getting the list of existing cluster images")
 	if images, err = k8s.GetAllImages(); err != nil {
-		message.Fatal(err, "Unable to generate a list of candidate images to perform the registry injection")
+		spinner.Fatalf(err, "Unable to generate a list of candidate images to perform the registry injection")
 	}
 
 	spinner.Updatef("Generating bootstrap payload SHASUMs")
 	if envVars, err = buildEnvVars(tempPath); err != nil {
-		message.Fatal(err, "Unable to build the injection pod environment variables")
+		spinner.Fatalf(err, "Unable to build the injection pod environment variables")
 	}
 
 	spinner.Updatef("Creating the injector configmap")
 	if err = createInjectorConfigmap(tempPath); err != nil {
-		message.Fatal(err, "Unable to create the injector configmap")
+		spinner.Fatalf(err, "Unable to create the injector configmap")
 	}
 
 	spinner.Updatef("Creating the injector service")
 	if service, err := createService(); err != nil {
-		message.Fatal(err, "Unable to create the injector service")
+		spinner.Fatalf(err, "Unable to create the injector service")
 	} else {
 		config.ZarfSeedPort = fmt.Sprintf("%d", service.Spec.Ports[0].NodePort)
 	}
 
 	spinner.Updatef("Loading the seed registry configmaps")
 	if payloadConfigmaps, sha256sum, err = createPayloadConfigmaps(tempPath, spinner); err != nil {
-		message.Fatal(err, "Unable to generate the injector payload configmaps")
+		spinner.Fatalf(err, "Unable to generate the injector payload configmaps")
 	}
 
 	// https://regex101.com/r/eLS3at/1
@@ -84,17 +84,23 @@ func runInjectionMadness(tempPath tempPaths) {
 		_ = k8s.DeletePod(k8s.ZarfNamespace, "injector")
 
 		// Update the podspec image path and use the first node found
-		pod := buildInjectionPod(node[0], image, envVars, payloadConfigmaps, sha256sum)
+		pod, err := buildInjectionPod(node[0], image, envVars, payloadConfigmaps, sha256sum)
+		if err != nil {
+			// Just debug log the output because failures just result in trying the next image
+			message.Debug(err)
+			continue
+		}
 
 		// Create the pod in the cluster
 		pod, err = k8s.CreatePod(pod)
-
-		// Just debug log the output because failures just result in trying the next image
-		message.Debug(pod, err)
+		if err != nil {
+			// Just debug log the output because failures just result in trying the next image
+			message.Debug(pod, err)
+			continue
+		}
 
 		// if no error, try and wait for a seed image to be present, return if successful
-		if err == nil && hasSeedImages(spinner) {
-			spinner.Success()
+		if hasSeedImages(spinner) {
 			return
 		}
 
@@ -106,7 +112,7 @@ func runInjectionMadness(tempPath tempPaths) {
 }
 
 func createPayloadConfigmaps(tempPath tempPaths, spinner *message.Spinner) ([]string, string, error) {
-	message.Debugf("packager.tryInjectorPayloadDeploy(%v)", tempPath)
+	message.Debugf("packager.tryInjectorPayloadDeploy(%#v)", tempPath)
 	var (
 		err        error
 		tarFile    []byte
@@ -116,7 +122,7 @@ func createPayloadConfigmaps(tempPath tempPaths, spinner *message.Spinner) ([]st
 	)
 
 	// Chunk size has to accomdate base64 encoding & etcd 1MB limit
-	tarPath := tempPath.base + "/payload.tgz"
+	tarPath := filepath.Join(tempPath.base, "payload.tgz")
 	tarFileList := []string{
 		tempPath.injectZarfBinary,
 		tempPath.seedImage,
@@ -132,7 +138,7 @@ func createPayloadConfigmaps(tempPath tempPaths, spinner *message.Spinner) ([]st
 	}
 
 	// Open the created archive for io.Copy
-	if tarFile, err = ioutil.ReadFile(tarPath); err != nil {
+	if tarFile, err = os.ReadFile(tarPath); err != nil {
 		return configMaps, "", err
 	}
 
@@ -187,30 +193,23 @@ func createPayloadConfigmaps(tempPath tempPaths, spinner *message.Spinner) ([]st
 func hasSeedImages(spinner *message.Spinner) bool {
 	message.Debugf("packager.hasSeedImages()")
 
-	// Get an available local port for the tunnel connection
-	localPort, err := k8s.GetAvailablePort()
+	// Establish the zarf connect tunnel
+	tunnel := k8s.NewZarfTunnel()
+	tunnel.AddSpinner(spinner)
+	tunnel.Connect(k8s.ZarfInjector, false)
+	defer tunnel.Close()
+
+	timeout := time.After(20 * time.Second)
+
+	ref, err := utils.SwapHostWithoutChecksum(config.ZarfSeedImage, tunnel.Endpoint())
 	if err != nil {
-		message.Debug(err)
+		message.Errorf(err, "Unable to swap the host of the seedImage for the injector pod: %#v", err)
 		return false
 	}
 
-	time.Sleep(3 * time.Second)
-
-	// Establish the zarf connect tunnel
-	tunnel := k8s.NewTunnel(k8s.ZarfNamespace, k8s.SvcResource, "zarf-injector", localPort, 5000)
-	// Add the spinner to avoid spinner collisions in the CLI
-	tunnel.AddSpinner(spinner)
-	tunnel.Establish()
-	defer tunnel.Close()
-
-	baseUrl := fmt.Sprintf("%s:%d", config.IPV4Localhost, localPort)
-	seedImage := config.GetSeedImage()
-	ref := fmt.Sprintf("%s/%s", baseUrl, seedImage)
-	timeout := time.After(15 * time.Second)
-
 	for {
-		// Delay check 3 seconds
-		time.Sleep(3 * time.Second)
+		// Delay check for one second
+		time.Sleep(1 * time.Second)
 		select {
 
 		// On timeout abort
@@ -222,7 +221,7 @@ func hasSeedImages(spinner *message.Spinner) bool {
 		default:
 			// Check for the existence of the image in the injection pod registry, on error continue
 			if _, err := crane.Manifest(ref, config.GetCraneOptions()...); err != nil {
-				message.Debugf("Could not get image ref %s: %v", ref, err)
+				message.Debugf("Could not get image ref %s: %#v", ref, err)
 			} else {
 				// If not error, return true, there image is present
 				return true
@@ -286,7 +285,7 @@ func buildEnvVars(tempPath tempPaths) ([]corev1.EnvVar, error) {
 	}
 
 	// Add the seed images list env var
-	envVars["SEED_IMAGE"] = config.GetSeedImage()
+	envVars["SEED_IMAGE"] = config.ZarfSeedImage
 
 	// Setup the env vars
 	encodedEnvVars := []corev1.EnvVar{}
@@ -301,12 +300,13 @@ func buildEnvVars(tempPath tempPaths) ([]corev1.EnvVar, error) {
 }
 
 // buildInjectionPod return a pod for injection with the appropriate containers to perform the injection
-func buildInjectionPod(node, image string, envVars []corev1.EnvVar, payloadConfigmaps []string, payloadShasum string) *corev1.Pod {
+func buildInjectionPod(node, image string, envVars []corev1.EnvVar, payloadConfigmaps []string, payloadShasum string) (*corev1.Pod, error) {
 	pod := k8s.GeneratePod("injector", k8s.ZarfNamespace)
 	executeMode := int32(0777)
-	seedImage := config.GetSeedImage()
 
 	pod.Labels["app"] = "zarf-injector"
+	// Ensure zarf agent doesnt break the injector on future runs
+	pod.Labels["zarf.dev/agent"] = "ignore"
 
 	// Bind the pod to the node the image was found on
 	pod.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": node}
@@ -354,7 +354,12 @@ func buildInjectionPod(node, image string, envVars []corev1.EnvVar, payloadConfi
 		},
 	}
 
-	// Container definition for the injector pod
+	// Create container definition for the injector pod
+	newHost, err := utils.SwapHostWithoutChecksum(config.ZarfSeedImage, "127.0.0.1:5001")
+	if err != nil {
+		message.Errorf(err, "Unable to swap the host of the seedImage for the injector pod: %#v", err)
+		return nil, err
+	}
 	pod.Spec.Containers = []corev1.Container{
 		{
 			Name: "injector",
@@ -367,8 +372,8 @@ func buildInjectionPod(node, image string, envVars []corev1.EnvVar, payloadConfi
 			Command: []string{
 				"/zarf-stage2/zarf-registry",
 				"/zarf-stage2/seed-image.tar",
-				seedImage,
-				utils.SwapHost(seedImage, "127.0.0.1:5001"),
+				config.ZarfSeedImage,
+				newHost,
 			},
 
 			// Shared mount between the init and regular containers
@@ -439,5 +444,5 @@ func buildInjectionPod(node, image string, envVars []corev1.EnvVar, payloadConfi
 		})
 	}
 
-	return pod
+	return pod, nil
 }

@@ -17,6 +17,8 @@ import (
 const horizontalRule = "───────────────────────────────────────────────────────────────────────────────────────"
 
 func getValidComponents(allComponents []types.ZarfComponent, requestedComponentNames []string) []types.ZarfComponent {
+	message.Debugf("packager.getValidComponents(%#v, %#v)", allComponents, requestedComponentNames)
+
 	var validComponentsList []types.ZarfComponent
 	var orderedKeys []string
 	var choiceComponents []string
@@ -62,7 +64,7 @@ func getValidComponents(allComponents []types.ZarfComponent, requestedComponentN
 			if requested {
 				// Mark deployment as appliance mode if this is an init config and the k3s component is enabled
 				if component.Name == k8s.DistroIsK3s && config.IsZarfInitConfig() {
-					config.DeployOptions.ApplianceMode = true
+					config.InitOptions.ApplianceMode = true
 				}
 				// Add the component to the list of valid components
 				validComponentsList = append(validComponentsList, component)
@@ -90,6 +92,8 @@ func getValidComponents(allComponents []types.ZarfComponent, requestedComponentN
 
 // Match on the first requested component that is not in the list of valid components and return the component name
 func validateRequests(validComponentsList []types.ZarfComponent, requestedComponentNames, choiceComponents []string) error {
+	message.Debugf("packager.validateRequests(%#v, %#v, %#v)", validComponentsList, requestedComponentNames, choiceComponents)
+
 	// Loop through each requested component names
 	for _, componentName := range requestedComponentNames {
 		found := false
@@ -118,12 +122,14 @@ func validateRequests(validComponentsList []types.ZarfComponent, requestedCompon
 }
 
 func isRequiredOrRequested(component types.ZarfComponent, requestedComponentNames []string) bool {
+	message.Debugf("packager.isRequiredOrRequested(%#v, %#v)", component, requestedComponentNames)
+
 	// If the component is required, then just return true
 	if component.Required {
 		return true
 	} else {
 		// Otherwise,check if this is one of the components that has been requested
-		if len(requestedComponentNames) > 0 || config.DeployOptions.Confirm {
+		if len(requestedComponentNames) > 0 || config.CommonOptions.Confirm {
 			for _, requestedComponent := range requestedComponentNames {
 				// If the component name matches one of the requested components, then return true
 				if strings.ToLower(requestedComponent) == component.Name {
@@ -139,8 +145,10 @@ func isRequiredOrRequested(component types.ZarfComponent, requestedComponentName
 
 // Confirm optional component
 func confirmOptionalComponent(component types.ZarfComponent) (confirmComponent bool) {
+	message.Debugf("packager.confirmOptionalComponent(%#v)", component)
+
 	// Confirm flag passed, just use defaults
-	if config.DeployOptions.Confirm {
+	if config.CommonOptions.Confirm {
 		return component.Default
 	}
 
@@ -159,13 +167,17 @@ func confirmOptionalComponent(component types.ZarfComponent) (confirmComponent b
 		Message: fmt.Sprintf("Deploy the %s component?", component.Name),
 		Default: component.Default,
 	}
-	_ = survey.AskOne(prompt, &confirmComponent)
+	if err := survey.AskOne(prompt, &confirmComponent); err != nil {
+		message.Fatalf(nil, "Confirm selection canceled: %s", err.Error())
+	}
 	return confirmComponent
 }
 
 func confirmChoiceGroup(componentGroup []types.ZarfComponent) types.ZarfComponent {
+	message.Debugf("packager.confirmChoiceGroup(%#v)", componentGroup)
+
 	// Confirm flag passed, just use defaults
-	if config.DeployOptions.Confirm {
+	if config.CommonOptions.Confirm {
 		var componentNames []string
 		for _, component := range componentGroup {
 			// If the component is default, then return it
@@ -176,7 +188,7 @@ func confirmChoiceGroup(componentGroup []types.ZarfComponent) types.ZarfComponen
 			componentNames = append(componentNames, component.Name)
 		}
 		// If no default component was found, give up
-		message.Fatalf(nil, "You must specify at least one component from the group %v when using the --confirm flag.", componentNames)
+		message.Fatalf(nil, "You must specify at least one component from the group %#v when using the --confirm flag.", componentNames)
 	}
 
 	pterm.Println(horizontalRule)
@@ -193,12 +205,17 @@ func confirmChoiceGroup(componentGroup []types.ZarfComponent) types.ZarfComponen
 		Message: "Select a component to deploy:",
 		Options: options,
 	}
-	_ = survey.AskOne(prompt, &chosen)
+
+	if err := survey.AskOne(prompt, &chosen); err != nil {
+		message.Fatalf(nil, "Component selection canceled: %s", err.Error())
+	}
 
 	return componentGroup[chosen]
 }
 
 func appendIfNotExists(slice []string, item string) []string {
+	message.Debugf("packager.appendIfNotExists(%#v, %s)", slice, item)
+
 	for _, s := range slice {
 		if s == item {
 			return slice

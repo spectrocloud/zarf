@@ -35,11 +35,19 @@ func FindImages(baseDir, repoHelmChartPath string) {
 		message.Note(fmt.Sprintf("Using base directory %s", baseDir))
 	}
 
-	if err := config.LoadConfig(config.ZarfYAML); err != nil {
+	if err := config.LoadConfig(config.ZarfYAML, false); err != nil {
 		message.Fatal(err, "Unable to read the zarf.yaml file")
 	}
 
-	components := GetComponents()
+	ComposeComponents()
+
+	// After components are composed, template the active package
+	if err := config.FillActiveTemplate(); err != nil {
+		message.Fatalf(err, "Unable to fill variables in template: %s", err.Error())
+	}
+
+	components := config.GetComponents()
+
 	tempPath := createPaths()
 	defer tempPath.clean()
 
@@ -110,7 +118,9 @@ func FindImages(baseDir, repoHelmChartPath string) {
 
 				for idx, path := range chart.ValuesFiles {
 					chartValueName := helm.StandardName(componentPath.values, chart) + "-" + strconv.Itoa(idx)
-					utils.CreatePathAndCopy(path, chartValueName)
+					if err := utils.CreatePathAndCopy(path, chartValueName); err != nil {
+						message.Fatalf(err, "Unable to copy values file %s", path)
+					}
 				}
 
 				var override string
@@ -191,7 +201,7 @@ func FindImages(baseDir, repoHelmChartPath string) {
 			for _, image := range sortedImages {
 				if descriptor, err := crane.Head(image, config.GetCraneOptions()...); err != nil {
 					// Test if this is a real image, if not just quiet log to debug, this is normal
-					message.Debugf("Suspected image does not appear to be valid: %w", err)
+					message.Debugf("Suspected image does not appear to be valid: %#v", err)
 				} else {
 					// Otherwise, add to the list of images
 					message.Debugf("Imaged digest found: %s", descriptor.Digest)

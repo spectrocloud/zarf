@@ -21,7 +21,7 @@ spec:
         - name: private-registry
       containers:
         - name: server
-          image: "###ZARF_REGISTRY###/defenseunicorns/zarf-agent:###ZARF_TAG###"
+          image: "###ZARF_REGISTRY###/###ZARF_CONST_AGENT_IMAGE###"
           imagePullPolicy: IfNotPresent
           livenessProbe:
             httpGet:
@@ -41,7 +41,13 @@ spec:
             - name: tls-certs
               mountPath: /etc/certs
               readOnly: true
+            - name: zarf-state
+              mountPath: /etc/zarf-state
+              readOnly: true
       volumes:
         - name: tls-certs
           secret:
             secretName: agent-hook-tls
+        - name: zarf-state
+          secret:
+            secretName: zarf-state

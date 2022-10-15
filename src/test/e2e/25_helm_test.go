@@ -11,7 +11,7 @@ import (
 
 func TestHelm(t *testing.T) {
 	t.Log("E2E: Helm chart")
-	e2e.setup(t)
+	e2e.setupWithCluster(t)
 	defer e2e.teardown(t)
 
 	path := fmt.Sprintf("build/zarf-package-test-helm-releasename-%s.tar.zst", e2e.arch)
@@ -24,8 +24,6 @@ func TestHelm(t *testing.T) {
 	kubectlOut, _ := exec.Command("kubectl", "get", "pods", "-n=helm-releasename", "--no-headers").Output()
 	assert.Contains(t, string(kubectlOut), "zarf-cool-name-podinfo")
 
-	e2e.chartsToRemove = append(e2e.chartsToRemove, ChartTarget{
-		namespace: "demo",
-		name:      "zarf-raw-example-data-injection-pod",
-	})
+	stdOut, stdErr, err = e2e.execZarfCommand("package", "remove", "test-helm-releasename", "--confirm")
+	require.NoError(t, err, stdOut, stdErr)
 }

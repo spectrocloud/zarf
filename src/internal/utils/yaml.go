@@ -5,7 +5,9 @@ package utils
 import (
 	"fmt"
 	"io/fs"
-	"io/ioutil"
+	"os"
+	"regexp"
+	"strings"
 
 	"github.com/defenseunicorns/zarf/src/internal/message"
 	"github.com/fatih/color"
@@ -70,7 +72,7 @@ func ColorPrintYAML(text string) {
 
 func ReadYaml(path string, destConfig any) error {
 	message.Debugf("Loading zarf config %s", path)
-	file, err := ioutil.ReadFile(path)
+	file, err := os.ReadFile(path)
 
 	if err != nil {
 		return err
@@ -86,5 +88,48 @@ func WriteYaml(path string, srcConfig any, perm fs.FileMode) error {
 		return err
 	}
 
-	return ioutil.WriteFile(path, content, perm)
+	return os.WriteFile(path, content, perm)
+}
+
+// ReloadYamlTemplate marshals a given config, replaces strings and unmarshals it back.
+func ReloadYamlTemplate(config any, mappings map[string]string) error {
+	text, err := yaml.Marshal(config)
+
+	if err != nil {
+		return err
+	}
+
+	for template, value := range mappings {
+		// Prevent user input from escaping the trailing " during yaml marshaling
+		lastIdx := len(value) - 1
+		if lastIdx > -1 && string(value[lastIdx]) == "\\" {
+			value = fmt.Sprintf("%s\\", value)
+		}
+		// Properly escape " in the yaml text output
+		value = strings.ReplaceAll(value, "\"", "\\\"")
+		text = []byte(strings.ReplaceAll(string(text), template, value))
+	}
+
+	return yaml.Unmarshal(text, config)
+}
+
+// FindYamlTemplates finds strings with a given prefix in a config.
+func FindYamlTemplates(config any, prefix string, suffix string) (map[string]*string, error) {
+	mappings := map[string]*string{}
+
+	text, err := yaml.Marshal(config)
+
+	if err != nil {
+		return mappings, err
+	}
+
+	// Find all strings that are between the given prefix and suffix
+	r := regexp.MustCompile(fmt.Sprintf("%s([A-Z_]+)%s", prefix, suffix))
+	matches := r.FindAllStringSubmatch(string(text), -1)
+
+	for _, match := range matches {
+		mappings[match[1]] = nil
+	}
+
+	return mappings, nil
 }
