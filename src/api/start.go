@@ -134,5 +134,5 @@ func LaunchAPIServer() {
 		})
 	}
 
-	http.ListenAndServe(":"+port, router)
+	http.ListenAndServe(fmt.Sprintf("%s:%s", host, port), router)
 }
