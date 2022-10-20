@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/defenseunicorns/zarf/src/api/auth"
+	"github.com/defenseunicorns/zarf/src/api/cluster"
+	"github.com/defenseunicorns/zarf/src/api/components"
+	"github.com/defenseunicorns/zarf/src/api/packages"
 	"github.com/defenseunicorns/zarf/src/config"
-	"github.com/defenseunicorns/zarf/src/internal/api/auth"
-	"github.com/defenseunicorns/zarf/src/internal/api/cluster"
-	"github.com/defenseunicorns/zarf/src/internal/api/components"
-	"github.com/defenseunicorns/zarf/src/internal/api/packages"
 	"github.com/defenseunicorns/zarf/src/internal/message"
 	"github.com/defenseunicorns/zarf/src/internal/utils"
 	"github.com/defenseunicorns/zarf/src/k8s"
@@ -31,6 +31,14 @@ func LaunchAPIServer() {
 
 	// If the env variable API_PORT is set, use that for the listening port
 	port := os.Getenv("API_PORT")
+
+	// if the env variable API_HOST is set, use that for the listening port
+	host := os.Getenv("API_HOST")
+
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
 	// Otherwise, use a random available port
 	if port == "" {
 		// If we can't find an available port, just use the default
@@ -99,12 +107,12 @@ func LaunchAPIServer() {
 
 	// If no dev port specified, use the server port for the URL and try to open it
 	if devPort == "" {
-		url := fmt.Sprintf("http://127.0.0.1:%s/auth?token=%s", port, token)
+		url := fmt.Sprintf("http://%s:%s/auth?token=%s", host, port, token)
 		message.Infof("Zarf UI connection: %s", url)
 		message.Debug(utils.ExecLaunchURL(url))
 	} else {
 		// Otherwise, use the dev port for the URL and don't try to open
-		message.Infof("Zarf UI connection: http://127.0.0.1:%s/auth?token=%s", devPort, token)
+		message.Infof("Zarf UI connection: http://%s:%s/auth?token=%s", host, devPort, token)
 	}
 
 	// Load the static UI files

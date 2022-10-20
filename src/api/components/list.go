@@ -3,8 +3,8 @@ package components
 import (
 	"net/http"
 
+	"github.com/defenseunicorns/zarf/src/api/common"
 	"github.com/defenseunicorns/zarf/src/config"
-	"github.com/defenseunicorns/zarf/src/internal/api/common"
 )
 
 // ListDeployedPackages writes a list of packages that have been deployed to the connected cluster.

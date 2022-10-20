@@ -5,9 +5,9 @@ import (
 	"fmt"
 
 	"github.com/alecthomas/jsonschema"
+	"github.com/defenseunicorns/zarf/src/api"
 	"github.com/defenseunicorns/zarf/src/config"
 	"github.com/defenseunicorns/zarf/src/internal/agent"
-	"github.com/defenseunicorns/zarf/src/internal/api"
 	"github.com/defenseunicorns/zarf/src/internal/git"
 	"github.com/defenseunicorns/zarf/src/internal/message"
 	"github.com/defenseunicorns/zarf/src/k8s"
