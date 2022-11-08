@@ -90,63 +90,79 @@ fn unpack(sha_sum: &String) {
 fn start_seed_registry(file_root: &Path) {
     let root = PathBuf::from(file_root);
     println!("Starting seed registry at {} on port 5000", root.display());
-    rouille::start_server("0.0.0.0:5000", move |request| {
-        rouille::log(request, io::stdout(), || {
-            router!(request,
-                (GET) (/v2/) => {
-                    // returns empty json w/ Docker-Distribution-Api-Version header set
-                    Response::text("{}")
-                    .with_unique_header("Content-Type", "application/json; charset=utf-8")
-                    .with_additional_header("Docker-Distribution-Api-Version", "registry/2.0")
-                    .with_additional_header("X-Content-Type-Options", "nosniff")
-                },
+    let cert = fs::read_to_string("server.crt")
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    let key = fs::read_to_string("server.key")
+        .unwrap()
+        .as_bytes()
+        .to_vec();
 
-                (GET) (/v2/registry/manifests/{_tag :String}) => {
-                    handle_get_manifest(&root)
-                },
+    rouille::Server::new_ssl(
+        "0.0.0.0:5000",
+        move |request| {
+            rouille::log(request, io::stdout(), || {
+                router!(request,
+                    (GET) (/v2/) => {
+                        // returns empty json w/ Docker-Distribution-Api-Version header set
+                        Response::text("{}")
+                        .with_unique_header("Content-Type", "application/json; charset=utf-8")
+                        .with_additional_header("Docker-Distribution-Api-Version", "registry/2.0")
+                        .with_additional_header("X-Content-Type-Options", "nosniff")
+                    },
 
-                (GET) (/v2/{_namespace :String}/registry/manifests/{_ref :String}) => {
-                    handle_get_manifest(&root)
-                },
+                    (GET) (/v2/registry/manifests/{_tag :String}) => {
+                        handle_get_manifest(&root)
+                    },
 
-                (HEAD) (/v2/registry/manifests/{_ref :String}) => {
-                    // a normal HEAD response has an empty body, but due to rouille not allowing for an override
-                    // on Content-Length, we respond the same as a GET
-                    accept!(
-                        request,
-                        "application/vnd.oci.image.manifest.v1+json" => {
-                            handle_get_manifest(&root)
-                        },
-                        "*/*" => Response::empty_406()
-                    )
-                },
+                    (GET) (/v2/{_namespace :String}/registry/manifests/{_ref :String}) => {
+                        handle_get_manifest(&root)
+                    },
 
-                (HEAD) (/v2/{_namespace :String}/registry/manifests/{_ref :String}) => {
-                    // a normal HEAD response has an empty body, but due to rouille not allowing for an override
-                    // on Content-Length, we respond the same as a GET
-                    accept!(
-                        request,
-                        "application/vnd.oci.image.manifest.v1+json" => {
-                            handle_get_manifest(&root)
-                        },
-                        "*/*" => Response::empty_406()
-                    )
-                },
+                    (HEAD) (/v2/registry/manifests/{_ref :String}) => {
+                        // a normal HEAD response has an empty body, but due to rouille not allowing for an override
+                        // on Content-Length, we respond the same as a GET
+                        accept!(
+                            request,
+                            "application/vnd.oci.image.manifest.v1+json" => {
+                                handle_get_manifest(&root)
+                            },
+                            "*/*" => Response::empty_406()
+                        )
+                    },
 
-                (GET) (/v2/registry/blobs/{digest :String}) => {
-                    handle_get_digest(&root, &digest)
-                },
+                    (HEAD) (/v2/{_namespace :String}/registry/manifests/{_ref :String}) => {
+                        // a normal HEAD response has an empty body, but due to rouille not allowing for an override
+                        // on Content-Length, we respond the same as a GET
+                        accept!(
+                            request,
+                            "application/vnd.oci.image.manifest.v1+json" => {
+                                handle_get_manifest(&root)
+                            },
+                            "*/*" => Response::empty_406()
+                        )
+                    },
 
-                (GET) (/v2/{_namespace :String}/registry/blobs/{digest :String}) => {
-                    handle_get_digest(&root, &digest)
-                },
+                    (GET) (/v2/registry/blobs/{digest :String}) => {
+                        handle_get_digest(&root, &digest)
+                    },
 
-                _ => {
-                    Response::empty_404()
-                }
-            )
-        })
-    });
+                    (GET) (/v2/{_namespace :String}/registry/blobs/{digest :String}) => {
+                        handle_get_digest(&root, &digest)
+                    },
+
+                    _ => {
+                        Response::empty_404()
+                    }
+                )
+            })
+        },
+        cert,
+        key,
+    )
+    .unwrap()
+    .run();
 }
 
 /// Handles the GET request for the manifest (only returns a OCI manifest regardless of Accept header)
