@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/go-git/go-git/v5"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,30 +43,7 @@ var packageCreateCmd = &cobra.Command{
 	Long: "Builds an archive of resources and dependencies defined by the 'zarf.yaml' in the active directory.\n" +
 		"Private registries and repositories are accessed via credentials in your local '~/.docker/config.json', " +
 		"'~/.git-credentials' and '~/.netrc'.\n",
-	Run: func(cmd *cobra.Command, args []string) {
-
-		var baseDir string
-
-		// If a directory was provided, use that as the base directory
-		if len(args) > 0 {
-			baseDir = args[0]
-		}
-
-		var isCleanPathRegex = regexp.MustCompile(`^[a-zA-Z0-9\_\-\/\.\~\\:]+$`)
-		if !isCleanPathRegex.MatchString(config.CommonOptions.CachePath) {
-			message.Warnf("Invalid characters in Zarf cache path, defaulting to %s", config.ZarfDefaultCachePath)
-			config.CommonOptions.CachePath = config.ZarfDefaultCachePath
-		}
-
-		// Configure the packager
-		pkgClient := packager.NewOrDie(&pkgConfig)
-		defer pkgClient.ClearTempPaths()
-
-		// Create the package
-		if err := pkgClient.Create(baseDir); err != nil {
-			message.Fatalf(err, "Failed to create package: %s", err.Error())
-		}
-	},
+	Run: CreatePackageCmd,
 }
 
 var packageDeployCmd = &cobra.Command{
@@ -183,6 +161,48 @@ var packageRemoveCmd = &cobra.Command{
 			message.Fatalf(err, "Unable to remove the package with an error of: %#v", err)
 		}
 	},
+}
+
+var UrlRegex = "^https?:\\/\\/(?:www\\.)?[-a-zA-Z0-9@:%._\\+~#=]{1,256}\\.[a-zA-Z0-9()]{1,6}\\b(?:[-a-zA-Z0-9()@:%_\\+.~#?&\\/=]*)$"
+
+func CreatePackageCmd(cmd *cobra.Command, args []string) {
+
+	var baseDir string
+
+	// If a directory was provided, use that as the base directory
+	if len(args) > 0 {
+		baseDir = args[0]
+	}
+
+	var isCleanPathRegex = regexp.MustCompile(`^[a-zA-Z0-9\_\-\/\.\~\\:]+$`)
+	if !isCleanPathRegex.MatchString(config.CommonOptions.CachePath) {
+		message.Warnf("Invalid characters in Zarf cache path, defaulting to %s", config.ZarfDefaultCachePath)
+		config.CommonOptions.CachePath = config.ZarfDefaultCachePath
+	}
+
+	var isRemoteUrlRegex = regexp.MustCompile(UrlRegex)
+	if isRemoteUrlRegex.MatchString(baseDir) {
+		message.Infof("Base directory path is a remote url %s, pulling down files into tmp directory", baseDir)
+
+		_, cloneErr := git.PlainClone(config.CommonOptions.TempDirectory, false, &git.CloneOptions{
+			URL:      baseDir,
+			Progress: os.Stdout,
+		})
+
+		if cloneErr != nil {
+			message.Warnf("Cannot pull the remote repo, aborting... %s", cloneErr)
+			return
+		}
+	}
+
+	// Configure the packager
+	pkgClient := packager.NewOrDie(&pkgConfig)
+	defer pkgClient.ClearTempPaths()
+
+	// Create the package
+	if err := pkgClient.Create(baseDir); err != nil {
+		message.Fatalf(err, "Failed to create package: %s", err.Error())
+	}
 }
 
 func choosePackage(args []string) string {
