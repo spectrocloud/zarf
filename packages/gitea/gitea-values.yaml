@@ -22,13 +22,14 @@ gitea:
     repository:
       ENABLE_PUSH_CREATE_USER: true
       FORCE_PRIVATE: true
+
 resources:
   requests:
-    cpu: "200m"
-    memory: "512Mi"
+    cpu: "###ZARF_VAR_GITEA_CPU_REQ###"
+    memory: "###ZARF_VAR_GITEA_MEM_REQ###"
   limits:
-    cpu: "1"
-    memory: "2Gi"
+    cpu: "###ZARF_VAR_GITEA_CPU_LIMIT###"
+    memory: "###ZARF_VAR_GITEA_MEM_LIMIT###"
 
 memcached:
   enabled: false

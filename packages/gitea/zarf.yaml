@@ -2,6 +2,23 @@ kind: ZarfPackageConfig
 metadata:
   name: "init-package-git-server"
 
+variables:
+  - name: GITEA_CPU_REQ
+    description: "The CPU request for gitea"
+    default: "200m"
+
+  - name: GITEA_MEM_REQ
+    description: "The memory request for gitea"
+    default: "512Mi"
+
+  - name: GITEA_CPU_LIMIT
+    description: "The CPU limit for gitea"
+    default: "3"
+
+  - name: GITEA_MEM_LIMIT
+    description: "The memory limit for gitea"
+    default: "2Gi"
+
 components:
   - name: git-server
     description: "Add Gitea for serving gitops-based clusters in an airgap"
